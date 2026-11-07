@@ -1,0 +1,44 @@
+<!DOCTYPE html><html><body style="margin:0;background:#000"><canvas id="c"></canvas>
+<script src="../js/levels.js"></script><script src="../js/game-core.js"></script>
+<script>
+function render(W,H){
+  var c=document.getElementById('c'); c.width=W; c.height=H; var x=c.getContext('2d');
+  var P=FrontPathGame.prototype;
+  var g=x.createRadialGradient(W/2,H*0.45,10,W/2,H*0.45,Math.max(W,H)*0.75);
+  g.addColorStop(0,'#1d3354'); g.addColorStop(0.6,'#121a24'); g.addColorStop(1,'#080c12');
+  x.fillStyle=g; x.fillRect(0,0,W,H);
+  var m=Math.min(W,H), cell=Math.round(m/(W>H?6.2:5.2));
+  var cols=Math.ceil(W/cell)+1, rows=Math.ceil(H/cell)+1;
+  var ox=(W-cols*cell)/2, oy=(H-rows*cell)/2;
+  var dirs='URDLUURRDLRUDLLU'; var seed=7;
+  function rnd(){seed=(seed*9301+49297)%233280;return seed/233280;}
+  for(var j=0;j<rows;j++)for(var i=0;i<cols;i++){
+    var cx=ox+(i+0.5)*cell, cy=oy+(j+0.5)*cell;
+    x.fillStyle='rgba(26,39,64,0.85)'; x.beginPath();
+    if(x.roundRect)x.roundRect(cx-cell*0.44,cy-cell*0.44,cell*0.88,cell*0.88,cell*0.14);else x.rect(cx-cell*0.44,cy-cell*0.44,cell*0.88,cell*0.88); x.fill();
+    var r=rnd();
+    if(r<0.62){
+      var d=dirs[Math.floor(rnd()*dirs.length)];
+      var col = r<0.06 ? '#6ee7a8' : '#5ad0ff';
+      P._drawArrowAt(x,cx,cy,d,col,0.9,0,cell);
+    }
+  }
+  // flying arrow trail
+  var ty=H*0.5;
+  // vignette band for title
+  var bh=m*0.36; var bg=x.createLinearGradient(0,ty-bh,0,ty+bh);
+  bg.addColorStop(0,'rgba(8,12,18,0)');bg.addColorStop(0.5,'rgba(8,12,18,0.86)');bg.addColorStop(1,'rgba(8,12,18,0)');
+  x.fillStyle=bg; x.fillRect(0,ty-bh,W,bh*2);
+  var fs=Math.round(Math.min(W*0.16, m*0.22));
+  x.font='900 '+fs+'px system-ui, -apple-system, "DejaVu Sans", sans-serif';
+  x.textAlign='center'; x.textBaseline='middle';
+  var lines = W/H<1 ? ['Front','Path'] : ['Front Path'];
+  lines.forEach(function(t,k){
+    var y=ty+(k-(lines.length-1)/2)*fs*1.05;
+    x.shadowColor='rgba(90,208,255,0.85)'; x.shadowBlur=fs*0.35;
+    var tg=x.createLinearGradient(0,y-fs/2,0,y+fs/2); tg.addColorStop(0,'#ffffff'); tg.addColorStop(1,'#9ae6ff');
+    x.fillStyle=tg; x.fillText(t,W/2,y);
+    x.shadowBlur=0; x.lineWidth=Math.max(2,fs*0.03); x.strokeStyle='#2a9fd6'; x.strokeText(t,W/2,y);
+  });
+}
+</script></body></html>

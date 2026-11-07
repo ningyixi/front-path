@@ -170,6 +170,11 @@
     this._newBest = false;
     this._audio = null;
     this._urgentBeepAt = 0;
+    // Optional platform hooks (e.g. CrazyGames). Null on WeChat.
+    this.platform = opts.platform || null;
+    this.adActive = false;
+    this.clearsSinceAd = 0;
+    this.revivedThisLevel = false;
 
     this._bindInput();
     this._running = true;
@@ -249,6 +254,44 @@
     this.flash = null;
     this.message = '';
     this.levelTimerFrozen = true;
+    this._pf('gameplayStop');
+  };
+
+  FrontPathGame.prototype._pf = function (name, a, b) {
+    var p = this.platform;
+    if (!p || typeof p[name] !== 'function') return false;
+    try {
+      p[name](a, b);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  FrontPathGame.prototype.setAdActive = function (on) {
+    this.adActive = !!on;
+    var ac = this._audio;
+    try {
+      if (ac) {
+        if (on && ac.state === 'running') ac.suspend();
+        else if (!on && ac.state === 'suspended') ac.resume();
+      }
+    } catch (e) {}
+  };
+
+  FrontPathGame.prototype._revive = function () {
+    if (this.state !== 'fail' || !this.board) return;
+    this.state = 'playing';
+    this.screen = 'playing';
+    this.revivedThisLevel = true;
+    this.levelElapsedMs = Math.max(0, performanceNow() - this.levelStartedAt);
+    this.levelTimeLimitMs = this.levelElapsedMs + 15000;
+    this.levelRemainingMs = 15000;
+    this.levelTimerFrozen = false;
+    this._urgentBeepAt = 0;
+    this.message = '+15s';
+    this.messageUntil = performanceNow() + 1200;
+    this._pf('gameplayStart');
   };
 
   FrontPathGame.prototype.resize = function (w, h, dpr) {
@@ -304,7 +347,9 @@
     this.failAt = 0;
     this._newBest = false;
     this._urgentBeepAt = 0;
+    this.revivedThisLevel = false;
     this._layout();
+    this._pf('gameplayStart');
   };
 
   FrontPathGame.prototype._ensureAudio = function () {
@@ -320,7 +365,7 @@
   };
 
   FrontPathGame.prototype._beep = function (kind) {
-    if (!this.soundOn) return;
+    if (!this.soundOn || this.adActive) return;
     var ac = this._ensureAudio();
     if (!ac) return;
     try {
@@ -494,6 +539,7 @@
   };
 
   FrontPathGame.prototype._onTap = function (x, y) {
+    if (this.adActive) return;
     var btn = this._hitButton(x, y);
     if (btn) {
       this._beep('tap');
@@ -537,6 +583,24 @@
       }
       if (btn.id === 'retry') {
         this.loadLevel(this.levelIndex);
+        return;
+      }
+      if (btn.id === 'revive') {
+        var selfR = this;
+        this._pf('requestRewarded', function () {
+          selfR._revive();
+        });
+        return;
+      }
+      if (btn.id === 'next' && (this.state === 'clear' || this.screen === 'clear') && this.clearsSinceAd >= 3 && this.platform) {
+        var selfM = this;
+        this.clearsSinceAd = 0;
+        var go = function () {
+          var L = selfM.levels();
+          if (selfM.levelIndex < L.length - 1) selfM.loadLevel(selfM.levelIndex + 1);
+          else selfM._goMenu();
+        };
+        if (!this._pf('requestMidgame', go)) go();
         return;
       }
       if (btn.id === 'next') {
@@ -666,6 +730,9 @@
       this.clearBurstAt = performanceNow();
       this._spawnClearParticles();
       this._beep('clear');
+      this.clearsSinceAd++;
+      this._pf('gameplayStop');
+      this._pf('happytime');
     }
   };
 
@@ -678,6 +745,7 @@
     this.failAt = performanceNow();
     this.anims = [];
     this._beep('fail');
+    this._pf('gameplayStop');
   };
 
   FrontPathGame.prototype._trySlide = function (arrow) {
@@ -1107,6 +1175,9 @@
       ctx.fillStyle = COLORS.muted;
       ctx.font = '14px system-ui, -apple-system, sans-serif';
       ctx.fillText('Retry and beat the countdown', w / 2, h / 2);
+      if (this.platform && this.platform.rewardedAvailable && !this.revivedThisLevel) {
+        this._drawBtn(ctx, w / 2 - 110, h / 2 + 28, 220, 48, 'Watch ad: +15s', 'revive', false, true);
+      }
     }
 
     // Footer: Menu always available (one-tap home)

@@ -6,6 +6,8 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="theme-color" content="#0b1017" />
   <title>Front Path</title>
+  <link rel="icon" href="data:,">
+  <script src="https://sdk.crazygames.com/crazygames-sdk-v3.js" onerror="window.__cgFail=1"></script>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
@@ -36,12 +38,19 @@
 </head>
 <body>
   <div id="wrap"><canvas id="game"></canvas></div>
-  <script src="js/levels.js?v=7"></script>
-  <script src="js/game-core.js?v=7"></script>
+  <script src="js/levels.js?v=8"></script>
+  <script src="js/game-core.js?v=8"></script>
+  <script src="js/crazy.js?v=8"></script>
   <script>
     (function () {
       var canvas = document.getElementById('game');
-      var game = new FrontPathGame(canvas, { dpr: window.devicePixelRatio || 1 });
+      var P = window.FrontPathPlatform;
+      var game = new FrontPathGame(canvas, { dpr: window.devicePixelRatio || 1, platform: P });
+      P.attach(game);
+      window.__frontPath = game;
+      window.FrontPathPlatformInit().then(function (on) {
+        if (on) { P.loadingStart(); P.loadingStop(); }
+      });
       function fit() {
         var w = Math.min(window.innerWidth, 480);
         var h = window.innerHeight;
