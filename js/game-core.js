@@ -1,9 +1,13 @@
 /**
  * Front Path — polished path-puzzle engine (WeChat + browser).
- * v6: Normal / Timed modes, tall portrait boards, concurrent slides, best times.
+ * v7: Easy/Medium/Hard (fill %), Menu home button, Normal/Timed, tall boards, concurrent slides.
  */
 (function (root) {
-  const { LEVELS, D } = root.FrontPathLevels;
+  const { D, LEVELS_BY_DIFFICULTY } = root.FrontPathLevels;
+  function levelsFor(diff) {
+    var pack = LEVELS_BY_DIFFICULTY && LEVELS_BY_DIFFICULTY[diff];
+    return pack && pack.length ? pack : (LEVELS_BY_DIFFICULTY.medium || []);
+  }
 
   const COLORS = {
     bg0: '#0b1017',
@@ -34,6 +38,10 @@
   const TOTAL_KEY = 'front_path_total_ms';
   const SOUND_KEY = 'front_path_sound';
   const MODE_KEY = 'front_path_mode';
+  const DIFF_KEY = 'front_path_difficulty';
+  const UNLOCK_PREFIX = 'front_path_max_unlocked_';
+  const BEST_PREFIX = 'front_path_best_';
+  const BEST_TIMED_PREFIX = 'front_path_best_timed_';
 
   function cloneLevel(level) {
     return {
@@ -130,19 +138,15 @@
     this.width = 0;
     this.height = 0;
 
-    this.maxUnlocked = Number(storageGet(UNLOCK_KEY, 1)) || 1;
-    if (this.maxUnlocked > LEVELS.length) this.maxUnlocked = LEVELS.length;
-    this.bestTimes = storageGet(BEST_KEY, {}) || {};
-    if (typeof this.bestTimes !== 'object') this.bestTimes = {};
-    this.bestTimesTimed = storageGet(BEST_TIMED_KEY, {}) || {};
-    if (typeof this.bestTimesTimed !== 'object') this.bestTimesTimed = {};
     this.soundOn = storageGet(SOUND_KEY, true) !== false;
     this.totalElapsedMs = Number(storageGet(TOTAL_KEY, 0)) || 0;
     this._totalAccruedBase = this.totalElapsedMs;
     var savedMode = storageGet(MODE_KEY, 'normal');
     this.mode = savedMode === 'timed' ? 'timed' : 'normal';
-
-    this.levelIndex = Math.min(Math.max(0, this.maxUnlocked - 1), LEVELS.length - 1);
+    var savedDiff = storageGet(DIFF_KEY, 'medium');
+    this.difficulty = savedDiff === 'easy' || savedDiff === 'hard' ? savedDiff : 'medium';
+    this._loadProgressForDifficulty();
+    this.levelIndex = Math.min(Math.max(0, this.maxUnlocked - 1), Math.max(0, this.levels().length - 1));
     this.screen = 'title'; // title | playing | clear | fail
     this.state = 'title';
     this.board = null;
@@ -181,6 +185,72 @@
     this._raf(this._loop);
   }
 
+
+  FrontPathGame.prototype.levels = function () {
+    return levelsFor(this.difficulty);
+  };
+
+  FrontPathGame.prototype._storageKeyUnlock = function () {
+    return UNLOCK_PREFIX + this.difficulty;
+  };
+
+  FrontPathGame.prototype._storageKeyBest = function () {
+    return BEST_PREFIX + this.difficulty + (this.mode === 'timed' ? '_timed' : '');
+  };
+
+  FrontPathGame.prototype._loadProgressForDifficulty = function () {
+    var levels = this.levels();
+    // Prefer per-difficulty unlock; fall back to legacy UNLOCK_KEY for medium
+    var unlocked = storageGet(this._storageKeyUnlock(), null);
+    if (unlocked == null && this.difficulty === 'medium') unlocked = storageGet(UNLOCK_KEY, 1);
+    this.maxUnlocked = Number(unlocked == null ? 1 : unlocked) || 1;
+    if (this.maxUnlocked > levels.length) this.maxUnlocked = Math.max(1, levels.length);
+
+    var bestKey = BEST_PREFIX + this.difficulty;
+    var bestTimedKey = BEST_TIMED_PREFIX + this.difficulty;
+    this.bestTimes = storageGet(bestKey, null);
+    if (this.bestTimes == null && this.difficulty === 'medium') this.bestTimes = storageGet(BEST_KEY, {});
+    if (typeof this.bestTimes !== 'object' || !this.bestTimes) this.bestTimes = {};
+
+    this.bestTimesTimed = storageGet(bestTimedKey, null);
+    if (this.bestTimesTimed == null && this.difficulty === 'medium') this.bestTimesTimed = storageGet(BEST_TIMED_KEY, {});
+    if (typeof this.bestTimesTimed !== 'object' || !this.bestTimesTimed) this.bestTimesTimed = {};
+  };
+
+  FrontPathGame.prototype._persistUnlock = function () {
+    storageSet(this._storageKeyUnlock(), this.maxUnlocked);
+    if (this.difficulty === 'medium') storageSet(UNLOCK_KEY, this.maxUnlocked);
+  };
+
+  FrontPathGame.prototype._persistBest = function () {
+    storageSet(BEST_PREFIX + this.difficulty, this.bestTimes);
+    storageSet(BEST_TIMED_PREFIX + this.difficulty, this.bestTimesTimed);
+    if (this.difficulty === 'medium') {
+      storageSet(BEST_KEY, this.bestTimes);
+      storageSet(BEST_TIMED_KEY, this.bestTimesTimed);
+    }
+  };
+
+  FrontPathGame.prototype._setDifficulty = function (diff) {
+    if (diff !== 'easy' && diff !== 'medium' && diff !== 'hard') return;
+    if (this.difficulty === diff) return;
+    this.difficulty = diff;
+    storageSet(DIFF_KEY, diff);
+    this._loadProgressForDifficulty();
+    this.levelIndex = Math.min(Math.max(0, this.maxUnlocked - 1), Math.max(0, this.levels().length - 1));
+  };
+
+  FrontPathGame.prototype._goMenu = function () {
+    this.screen = 'title';
+    this.state = 'title';
+    this.board = null;
+    this.anims = [];
+    this.particles = [];
+    this.flash = null;
+    this.message = '';
+    this.levelTimerFrozen = true;
+  };
+
   FrontPathGame.prototype.resize = function (w, h, dpr) {
     this.dpr = dpr || this.dpr || 1;
     this.width = w;
@@ -200,7 +270,7 @@
     // Portrait-first: thinner side padding, taller usable board area
     var padX = Math.max(8, Math.floor(this.width * 0.025));
     var header = Math.max(88, Math.min(118, Math.floor(this.height * 0.13)));
-    var footer = Math.max(72, Math.min(100, Math.floor(this.height * 0.11)));
+    var footer = Math.max(78, Math.min(110, Math.floor(this.height * 0.12)));
     var availW = this.width - padX * 2;
     var availH = this.height - header - footer;
     var cell = Math.floor(Math.min(availW / this.board.w, availH / this.board.h));
@@ -215,6 +285,7 @@
   };
 
   FrontPathGame.prototype.loadLevel = function (index) {
+    var LEVELS = this.levels();
     index = Math.max(0, Math.min(index, LEVELS.length - 1));
     this.levelIndex = index;
     this.board = cloneLevel(LEVELS[index]);
@@ -434,20 +505,29 @@
         this._setMode('timed');
         return;
       }
+      if (btn.id === 'diff_easy') {
+        this._setDifficulty('easy');
+        return;
+      }
+      if (btn.id === 'diff_medium') {
+        this._setDifficulty('medium');
+        return;
+      }
+      if (btn.id === 'diff_hard') {
+        this._setDifficulty('hard');
+        return;
+      }
       if (btn.id === 'play') {
         this.loadLevel(0);
         return;
       }
       if (btn.id === 'continue') {
+        var LEVELS = this.levels();
         this.loadLevel(Math.min(this.maxUnlocked - 1, LEVELS.length - 1));
         return;
       }
       if (btn.id === 'menu') {
-        this.screen = 'title';
-        this.state = 'title';
-        this.board = null;
-        this.anims = [];
-        this.particles = [];
+        this._goMenu();
         return;
       }
       if (btn.id === 'sound') {
@@ -460,13 +540,10 @@
         return;
       }
       if (btn.id === 'next') {
+        var LEVELS2 = this.levels();
         if (this.state === 'clear' || this.screen === 'clear') {
-          if (this.levelIndex < LEVELS.length - 1) this.loadLevel(this.levelIndex + 1);
-          else {
-            this.screen = 'title';
-            this.state = 'title';
-            this.board = null;
-          }
+          if (this.levelIndex < LEVELS2.length - 1) this.loadLevel(this.levelIndex + 1);
+          else this._goMenu();
         } else if (this.levelIndex + 1 < this.maxUnlocked) {
           this.loadLevel(this.levelIndex + 1);
         }
@@ -542,7 +619,7 @@
       var prev = this.bestTimesTimed[id];
       if (prev == null || rem > prev) {
         this.bestTimesTimed[id] = rem;
-        storageSet(BEST_TIMED_KEY, this.bestTimesTimed);
+        this._persistBest();
         this._newBest = true;
       } else {
         this._newBest = false;
@@ -551,7 +628,7 @@
       var prevN = this.bestTimes[id];
       if (prevN == null || this.levelElapsedMs < prevN) {
         this.bestTimes[id] = this.levelElapsedMs;
-        storageSet(BEST_KEY, this.bestTimes);
+        this._persistBest();
         this._newBest = true;
       } else {
         this._newBest = false;
@@ -584,8 +661,8 @@
         this._recordBest();
       }
       var unlocked = Math.max(this.maxUnlocked, this.levelIndex + 2);
-      this.maxUnlocked = Math.min(unlocked, LEVELS.length);
-      storageSet(UNLOCK_KEY, this.maxUnlocked);
+      this.maxUnlocked = Math.min(unlocked, this.levels().length);
+      this._persistUnlock();
       this.clearBurstAt = performanceNow();
       this._spawnClearParticles();
       this._beep('clear');
@@ -740,21 +817,24 @@
 
   FrontPathGame.prototype._drawTitle = function (ctx, w, h, ts) {
     var pulse = 0.5 + 0.5 * Math.sin((ts || 0) / 500);
+    var LEVELS = this.levels();
+    var fillHint =
+      this.difficulty === 'easy' ? '~25% filled' : this.difficulty === 'hard' ? '~85% filled' : '~55% filled';
 
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = COLORS.text;
-    ctx.font = 'bold 40px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Front Path', w / 2, h * 0.12);
+    ctx.font = 'bold 36px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Front Path', w / 2, h * 0.07);
 
     ctx.fillStyle = COLORS.muted;
-    ctx.font = '14px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Slide arrows off the board · plan the order', w / 2, h * 0.12 + 32);
+    ctx.font = '13px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Slide arrows off · plan the order', w / 2, h * 0.07 + 28);
 
-    var demoY = h * 0.24;
+    var demoY = h * 0.155;
     var dirs = ['L', 'U', 'R', 'D'];
     for (var i = 0; i < 4; i++) {
-      this._drawArrowAt(ctx, w / 2 + (i - 1.5) * 52, demoY, dirs[i], COLORS.arrow, 0.75 + pulse * 0.25, 0, 40);
+      this._drawArrowAt(ctx, w / 2 + (i - 1.5) * 48, demoY, dirs[i], COLORS.arrow, 0.75 + pulse * 0.25, 0, 36);
     }
 
     var cleared = 0;
@@ -766,41 +846,57 @@
     ctx.fillText(
       LEVELS.length + ' levels · ' + Math.max(0, this.maxUnlocked - 1) + ' cleared · records ' + cleared,
       w / 2,
-      h * 0.32
+      h * 0.21
     );
 
-    // Mode select
+    // Difficulty
     ctx.fillStyle = COLORS.muted;
     ctx.font = '13px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Choose mode', w / 2, h * 0.38);
+    ctx.fillText('Difficulty', w / 2, h * 0.255);
 
-    var gap = 12;
-    var modeW = Math.min(150, (w - 48 - gap) / 2);
-    var modeH = 64;
-    var modeY = h * 0.42;
-    var leftX = w / 2 - modeW - gap / 2;
-    var rightX = w / 2 + gap / 2;
+    var gap = 8;
+    var diffW = Math.min(104, (w - 40 - gap * 2) / 3);
+    var diffH = 58;
+    var diffY = h * 0.275;
+    var totalDiffW = diffW * 3 + gap * 2;
+    var diffStartX = (w - totalDiffW) / 2;
+    this._drawModeCard(ctx, diffStartX, diffY, diffW, diffH, 'Easy', '~25% fill', 'diff_easy', this.difficulty === 'easy');
+    this._drawModeCard(ctx, diffStartX + diffW + gap, diffY, diffW, diffH, 'Medium', '~55% fill', 'diff_medium', this.difficulty === 'medium');
+    this._drawModeCard(ctx, diffStartX + (diffW + gap) * 2, diffY, diffW, diffH, 'Hard', '~85% fill', 'diff_hard', this.difficulty === 'hard');
 
+    // Mode
+    ctx.fillStyle = COLORS.muted;
+    ctx.font = '13px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Mode', w / 2, diffY + diffH + 22);
+
+    var modeW = Math.min(150, (w - 48 - 12) / 2);
+    var modeH = 58;
+    var modeY = diffY + diffH + 34;
+    var leftX = w / 2 - modeW - 6;
+    var rightX = w / 2 + 6;
     this._drawModeCard(ctx, leftX, modeY, modeW, modeH, 'Normal', 'No limit · stopwatch', 'mode_normal', this.mode === 'normal');
     this._drawModeCard(ctx, rightX, modeY, modeW, modeH, 'Timed', 'Countdown · urgency', 'mode_timed', this.mode === 'timed');
 
     var bw = Math.min(240, w - 48);
-    var bh = 52;
+    var bh = 48;
     var bx = (w - bw) / 2;
-    var playY = modeY + modeH + 28;
+    var playY = modeY + modeH + 20;
     this._drawBtn(ctx, bx, playY, bw, bh, this.maxUnlocked > 1 ? 'Continue' : 'Play', this.maxUnlocked > 1 ? 'continue' : 'play', false, true);
     if (this.maxUnlocked > 1) {
-      this._drawBtn(ctx, bx, playY + 64, bw, bh, 'Play from Level 1', 'play', false, false);
+      this._drawBtn(ctx, bx, playY + 56, bw, bh, 'Play from Level 1', 'play', false, false);
     }
-    var soundY = playY + (this.maxUnlocked > 1 ? 128 : 64);
-    this._drawBtn(ctx, bx, soundY, bw, 44, this.soundOn ? 'Sound: On' : 'Sound: Off', 'sound', false, false);
+    var soundY = playY + (this.maxUnlocked > 1 ? 112 : 56);
+    this._drawBtn(ctx, bx, soundY, bw, 40, this.soundOn ? 'Sound: On' : 'Sound: Off', 'sound', false, false);
 
     ctx.fillStyle = COLORS.muted;
-    ctx.font = '12px system-ui, -apple-system, sans-serif';
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
     ctx.fillText(
-      this.mode === 'timed' ? 'Beat the clock on every level' : 'Take your time · chase best times',
+      (this.difficulty.charAt(0).toUpperCase() + this.difficulty.slice(1)) +
+        ' · ' +
+        fillHint +
+        (this.mode === 'timed' ? ' · beat the clock' : ' · chase best times'),
       w / 2,
-      h - 36
+      h - 28
     );
   };
 
@@ -845,7 +941,7 @@
     ctx.fillStyle = COLORS.muted;
     ctx.font = '12px system-ui, -apple-system, sans-serif';
     ctx.fillText(
-      'Lv ' + lv.id + '/' + LEVELS.length + ' · ' + lv.name + ' · ' + lv.w + '×' + lv.h,
+      'Lv ' + lv.id + '/' + this.levels().length + ' · ' + lv.name + ' · ' + lv.w + '×' + lv.h + ' · ' + this.difficulty,
       16,
       36
     );
@@ -1013,32 +1109,34 @@
       ctx.fillText('Retry and beat the countdown', w / 2, h / 2);
     }
 
-    // Footer buttons
+    // Footer: Menu always available (one-tap home)
     var btnY = this.footerY;
     var btnH = 46;
-    var gap = 10;
-    var btnW = Math.min(108, (w - 36 - gap * 2) / 3);
-    this._drawBtn(ctx, 16, btnY, btnW, btnH, 'Retry', 'retry', false, this.state === 'fail');
-    var midX = (w - btnW) / 2;
-    if (this.levelIndex > 0) this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Prev', 'prev');
-    else this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Menu', 'menu');
+    var gap = 8;
+    var btnW = Math.min(92, (w - 32 - gap * 3) / 4);
+    this._drawBtn(ctx, 12, btnY, btnW, btnH, 'Menu', 'menu', false, false);
+    this._drawBtn(ctx, 12 + btnW + gap, btnY, btnW, btnH, 'Retry', 'retry', false, this.state === 'fail');
+    var prevX = 12 + (btnW + gap) * 2;
+    this._drawBtn(ctx, prevX, btnY, btnW, btnH, 'Prev', 'prev', this.levelIndex <= 0, false);
 
+    var LEVELS = this.levels();
     var nextLabel =
       this.state === 'clear'
         ? this.levelIndex < LEVELS.length - 1
           ? 'Next'
-          : 'Menu'
+          : 'Home'
         : 'Next';
     var nextEnabled = this.state === 'clear' || this.levelIndex + 1 < this.maxUnlocked;
+    var nextId = this.state === 'clear' && this.levelIndex >= LEVELS.length - 1 ? 'menu' : 'next';
     this._drawBtn(
       ctx,
-      w - 16 - btnW,
+      w - 12 - btnW,
       btnY,
       btnW,
       btnH,
       nextLabel,
-      'next',
-      !nextEnabled && this.state !== 'clear',
+      nextId,
+      nextId === 'next' && !nextEnabled && this.state !== 'clear',
       this.state === 'clear'
     );
   };
@@ -1129,7 +1227,7 @@
   };
 
   root.FrontPathGame = FrontPathGame;
-  root.FrontPathLEVELS = LEVELS;
+  root.FrontPathLEVELS = levelsFor("medium");
 })(
   typeof GameGlobal !== 'undefined'
     ? GameGlobal
