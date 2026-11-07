@@ -1,6 +1,7 @@
 /**
  * Front Path — shared canvas path-puzzle engine.
  * Works in WeChat mini-game (wx) and browser (Canvas + localStorage).
+ * multi-anim v4 + timer: no global lock; departing arrows free hits immediately.
  */
 (function (root) {
   const { LEVELS, D } = root.FrontPathLevels;
@@ -85,6 +86,11 @@
     this.buttons = [];
     this.message = '';
     this.messageUntil = 0;
+    this.levelStartedAt = 0;
+    this.levelElapsedMs = 0;
+    this.levelTimerFrozen = false;
+    this.totalElapsedMs = Number(storageGet('front_path_total_ms', 0)) || 0;
+    this._totalAccruedBase = this.totalElapsedMs;
 
     this.loadLevel(this.levelIndex);
     this._bindInput();
@@ -145,39 +151,76 @@
     this.anims = [];
     this.flash = null;
     this.message = '';
+    this.levelStartedAt = performanceNow();
+    this.levelElapsedMs = 0;
+    this.levelTimerFrozen = false;
     this._layout();
   };
 
   FrontPathGame.prototype._bindInput = function () {
     const self = this;
-    const onDown = function (x, y) {
+    this._lastPointerId = null;
+    this._lastTapAt = 0;
+    this._lastTapKey = '';
+
+    const onDown = function (x, y, pointerId) {
+      // Deduplicate touchstart+mousedown / pointer+mouse for the SAME gesture only.
+      // Never block a tap on a different arrow.
+      const now = performanceNow();
+      const key = Math.round(x) + ':' + Math.round(y);
+      if (pointerId != null && pointerId === self._lastPointerId && now - self._lastTapAt < 40) return;
+      if (key === self._lastTapKey && now - self._lastTapAt < 40) return;
+      self._lastPointerId = pointerId;
+      self._lastTapAt = now;
+      self._lastTapKey = key;
       self._onTap(x, y);
     };
 
     if (typeof wx !== 'undefined' && wx.onTouchStart) {
       wx.onTouchStart(function (e) {
-        const t = e.touches[0];
-        onDown(t.clientX, t.clientY);
+        const touches = e.changedTouches || e.touches || [];
+        for (let i = 0; i < touches.length; i++) {
+          const t = touches[i];
+          onDown(t.clientX, t.clientY, t.identifier);
+        }
       });
       return;
     }
 
     const el = this.canvas;
-    const handler = function (e) {
-      e.preventDefault();
+    const toLocal = function (e) {
       const rect = el.getBoundingClientRect();
-      let clientX, clientY;
-      if (e.touches && e.touches[0]) {
+      let clientX, clientY, pid = null;
+      if (e.changedTouches && e.changedTouches[0]) {
+        clientX = e.changedTouches[0].clientX;
+        clientY = e.changedTouches[0].clientY;
+        pid = e.changedTouches[0].identifier;
+      } else if (e.touches && e.touches[0]) {
         clientX = e.touches[0].clientX;
         clientY = e.touches[0].clientY;
+        pid = e.touches[0].identifier;
       } else {
         clientX = e.clientX;
         clientY = e.clientY;
+        pid = e.pointerId != null ? e.pointerId : 'mouse';
       }
-      onDown(clientX - rect.left, clientY - rect.top);
+      return { x: clientX - rect.left, y: clientY - rect.top, pid: pid };
     };
-    el.addEventListener('mousedown', handler);
-    el.addEventListener('touchstart', handler, { passive: false });
+
+    const handler = function (e) {
+      // Always handle; never wait on animations.
+      if (e.cancelable) e.preventDefault();
+      const p = toLocal(e);
+      onDown(p.x, p.y, p.pid);
+    };
+
+    // Prefer pointerdown (mouse + touch + pen). Keep touchstart/mousedown as fallback.
+    if (typeof window !== 'undefined' && window.PointerEvent) {
+      el.addEventListener('pointerdown', handler, { passive: false });
+    } else {
+      el.addEventListener('mousedown', handler);
+      el.addEventListener('touchstart', handler, { passive: false });
+    }
   };
 
   FrontPathGame.prototype._hitButton = function (x, y) {
@@ -189,14 +232,39 @@
   };
 
   FrontPathGame.prototype._isSliding = function (arrow) {
+    if (!arrow) return false;
+    if (arrow.departing) return true;
     for (let i = 0; i < this.anims.length; i++) {
       if (this.anims[i].type === 'slide' && this.anims[i].arrow === arrow) return true;
     }
     return false;
   };
 
+  /** Nearest idle (non-departing) arrow; generous touch radius. */
+  FrontPathGame.prototype._hitArrow = function (x, y) {
+    const cell = this.cell || 1;
+    const radius = cell * 0.72; // large touch target
+    const r2 = radius * radius;
+    let best = null;
+    let bestDist = r2;
+    for (let i = 0; i < this.board.arrows.length; i++) {
+      const a = this.board.arrows[i];
+      if (a.departing) continue;
+      const cx = this.originX + (a.x + 0.5) * cell;
+      const cy = this.originY + (a.y + 0.5) * cell;
+      const dx = x - cx;
+      const dy = y - cy;
+      const d2 = dx * dx + dy * dy;
+      if (d2 <= bestDist) {
+        bestDist = d2;
+        best = a;
+      }
+    }
+    return best;
+  };
+
   FrontPathGame.prototype._onTap = function (x, y) {
-    // Buttons always work; arrow taps allowed while other arrows are mid-slide.
+    // Buttons always work; NEVER gate on animations / busy / single-anim lock.
     const btn = this._hitButton(x, y);
     if (btn) {
       if (btn.id === 'retry') this.loadLevel(this.levelIndex);
@@ -214,15 +282,9 @@
 
     if (this.state !== 'playing') return;
 
-    const gx = Math.floor((x - this.originX) / this.cell);
-    const gy = Math.floor((y - this.originY) / this.cell);
-    if (gx < 0 || gy < 0 || gx >= this.board.w || gy >= this.board.h) return;
-
-    const arrow = this.board.arrows.find(function (a) {
-      return a.x === gx && a.y === gy;
-    });
+    const arrow = this._hitArrow(x, y);
     if (!arrow) return;
-    if (this._isSliding(arrow)) return; // already departing
+    // Start immediately — concurrent slides are allowed.
     this._trySlide(arrow);
   };
 
@@ -230,8 +292,8 @@
     for (let i = 0; i < this.board.arrows.length; i++) {
       const a = this.board.arrows[i];
       if (a === skip) continue;
-      // Sliding-out arrows are treated as already cleared for blocking.
-      if (this._isSliding(a)) continue;
+      // Departing / sliding-out arrows do not block — chains work mid-flight.
+      if (a.departing || this._isSliding(a)) continue;
       if (a.x === x && a.y === y) return true;
     }
     return false;
@@ -250,18 +312,24 @@
       x += dir[0];
       y += dir[1];
     }
-    // Exit off the board — success; last step is just past the edge
     return { ok: true, path: path, exit: { x: x, y: y } };
   };
 
   FrontPathGame.prototype._checkClear = function () {
     if (this.state !== 'playing') return;
-    // Wait until every arrow is gone and no slide still drawing.
+    const idle = this.board.arrows.filter(function (a) { return !a.departing; });
     const sliding = this.anims.some(function (a) { return a.type === 'slide'; });
-    if (this.board.arrows.length === 0 && !sliding) {
+    if (idle.length === 0 && !sliding) {
       this.state = 'clear';
       this.message = 'Clear!';
       this.messageUntil = performanceNow() + 2000;
+      if (!this.levelTimerFrozen) {
+        this.levelElapsedMs = Math.max(0, performanceNow() - this.levelStartedAt);
+        this.levelTimerFrozen = true;
+        this.totalElapsedMs = this._totalAccruedBase + this.levelElapsedMs;
+        this._totalAccruedBase = this.totalElapsedMs;
+        storageSet('front_path_total_ms', this.totalElapsedMs);
+      }
       const unlocked = Math.max(this.maxUnlocked, this.levelIndex + 2);
       this.maxUnlocked = Math.min(unlocked, LEVELS.length);
       storageSet('front_path_max_unlocked', this.maxUnlocked);
@@ -269,12 +337,12 @@
   };
 
   FrontPathGame.prototype._trySlide = function (arrow) {
+    if (!arrow || arrow.departing) return;
     const result = this._pathClear(arrow);
     if (!result.ok) {
       this.flash = { arrow: arrow, until: performanceNow() + 220, kind: 'blocked' };
       this.message = 'Blocked';
       this.messageUntil = performanceNow() + 600;
-      // Drop any prior shake on this arrow, then add a new one (non-blocking).
       this.anims = this.anims.filter(function (a) {
         return !(a.type === 'shake' && a.arrow === arrow);
       });
@@ -287,7 +355,12 @@
       return;
     }
 
-    // Animate sliding out — other arrows remain tappable.
+    // Mark departing IMMEDIATELY so:
+    // 1) other taps never wait
+    // 2) this cell is free for hit-testing other arrows' paths
+    // 3) collision treats it as already cleared
+    arrow.departing = true;
+
     const cells = result.path.slice();
     cells.push(result.exit);
     const anim = {
@@ -295,7 +368,7 @@
       arrow: arrow,
       cells: cells,
       t0: performanceNow(),
-      dur: Math.max(180, cells.length * 70),
+      dur: Math.max(140, cells.length * 55),
     };
     const self = this;
     anim.onDone = function () {
@@ -308,6 +381,8 @@
       self._checkClear();
     };
     this.anims.push(anim);
+    // Eager clear-check so UI can show progress; full clear waits for anims.
+    // (kept playing until slides finish)
   };
 
   function performanceNow() {
@@ -325,6 +400,9 @@
   };
 
   FrontPathGame.prototype._update = function (ts) {
+    if (!this.levelTimerFrozen && this.state === 'playing' && this.levelStartedAt) {
+      this.levelElapsedMs = Math.max(0, ts - this.levelStartedAt);
+    }
     // Copy list — onDone mutates this.anims
     const list = this.anims.slice();
     for (let i = 0; i < list.length; i++) {
@@ -360,11 +438,22 @@
     ctx.fillStyle = COLORS.muted;
     ctx.font = '14px system-ui, -apple-system, sans-serif';
     const lv = this.board;
-    ctx.fillText('Level ' + lv.id + ' · ' + lv.name, 20, 48);
+    ctx.fillText('Level ' + lv.id + ' · ' + lv.name + ' / ' + LEVELS.length, 20, 48);
 
     ctx.textAlign = 'right';
     ctx.fillStyle = COLORS.accent;
-    ctx.fillText(lv.arrows.length + ' left', w - 20, 48);
+    var leftCount = 0;
+    for (var li = 0; li < lv.arrows.length; li++) if (!lv.arrows[li].departing) leftCount++;
+    ctx.fillText(leftCount + ' left', w - 20, 48);
+
+    // Level timer (mm:ss) — freezes on Clear
+    ctx.textAlign = 'right';
+    ctx.fillStyle = this.levelTimerFrozen ? COLORS.arrowOk : COLORS.text;
+    ctx.font = 'bold 18px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(formatTime(this.levelElapsedMs), w - 20, 18);
+    ctx.fillStyle = COLORS.muted;
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    ctx.fillText(this.levelTimerFrozen ? 'cleared' : 'level time', w - 20, 38);
 
     // Board background
     const boardW = this.cell * lv.w;
@@ -431,6 +520,12 @@
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('Clear!', w / 2, h / 2 - 40);
+      ctx.fillStyle = COLORS.text;
+      ctx.font = 'bold 20px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillText(formatTime(this.levelElapsedMs), w / 2, h / 2 + 4);
+      ctx.fillStyle = COLORS.muted;
+      ctx.font = '13px system-ui, -apple-system, sans-serif';
+      ctx.fillText('level time', w / 2, h / 2 + 28);
     }
 
     // Transient message
@@ -522,6 +617,14 @@
 
   function easeIn(t) {
     return t * t;
+  }
+
+  function formatTime(ms) {
+    ms = Math.max(0, Math.floor(ms || 0));
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
   }
 
   FrontPathGame.prototype.destroy = function () {
