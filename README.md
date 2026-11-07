@@ -6,11 +6,12 @@ Arrow-slide path puzzle — **WeChat mini-game** + browser.
 
 ## Features
 
-- 100 DFS-verified levels (boards grow harder)
+- **Normal Mode** — stopwatch, chase best clear times
+- **Timed Mode** — per-level countdown; fail & retry if time hits 0
+- 110 DFS-verified levels on **tall portrait boards** (phone-friendly)
 - Concurrent slides — tap the next arrow while others move
-- Level timer + best times saved locally
-- Title screen, clear celebration, soft sound toggle
-- English UI
+- Best times saved locally (separate for each mode)
+- English UI, soft sound toggle
 
 ## Controls
 

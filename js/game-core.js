@@ -1,6 +1,6 @@
 /**
  * Front Path — polished path-puzzle engine (WeChat + browser).
- * multi-anim v5: concurrent slides, level timer, best times, start screen.
+ * v6: Normal / Timed modes, tall portrait boards, concurrent slides, best times.
  */
 (function (root) {
   const { LEVELS, D } = root.FrontPathLevels;
@@ -19,6 +19,8 @@
     text: '#eef3fb',
     muted: '#8fa3bc',
     accent: '#ffc857',
+    danger: '#ff5c7a',
+    warn: '#ffb020',
     btn: '#243652',
     btnEdge: '#3d5a80',
     btnPrimary: '#2f7dd1',
@@ -27,9 +29,11 @@
   };
 
   const BEST_KEY = 'front_path_best_times';
+  const BEST_TIMED_KEY = 'front_path_best_times_timed';
   const UNLOCK_KEY = 'front_path_max_unlocked';
   const TOTAL_KEY = 'front_path_total_ms';
   const SOUND_KEY = 'front_path_sound';
+  const MODE_KEY = 'front_path_mode';
 
   function cloneLevel(level) {
     return {
@@ -91,9 +95,29 @@
     return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
   }
 
-  function easeOutCubic(t) {
-    return 1 - Math.pow(1 - t, 3);
+  function formatCountdown(ms) {
+    ms = Math.max(0, Math.ceil(ms || 0));
+    var totalSec = Math.floor(ms / 1000);
+    var frac = Math.floor((ms % 1000) / 100);
+    var m = Math.floor(totalSec / 60);
+    var sec = totalSec % 60;
+    if (m > 0) {
+      return m + ':' + (sec < 10 ? '0' : '') + sec;
+    }
+    return sec + '.' + frac + 's';
   }
+
+  /** Per-level countdown budget for Timed Mode (ms). */
+  function timeLimitFor(level) {
+    var n = level.arrows.length;
+    var area = level.w * level.h;
+    var id = level.id || 1;
+    // Early: ~18–28s, mid: ~40–60s, late: ~70–110s
+    var sec = 14 + id * 0.55 + n * 1.65 + area * 0.12;
+    sec = Math.max(16, Math.min(120, Math.round(sec)));
+    return sec * 1000;
+  }
+
   function easeIn(t) {
     return t * t;
   }
@@ -110,12 +134,16 @@
     if (this.maxUnlocked > LEVELS.length) this.maxUnlocked = LEVELS.length;
     this.bestTimes = storageGet(BEST_KEY, {}) || {};
     if (typeof this.bestTimes !== 'object') this.bestTimes = {};
+    this.bestTimesTimed = storageGet(BEST_TIMED_KEY, {}) || {};
+    if (typeof this.bestTimesTimed !== 'object') this.bestTimesTimed = {};
     this.soundOn = storageGet(SOUND_KEY, true) !== false;
     this.totalElapsedMs = Number(storageGet(TOTAL_KEY, 0)) || 0;
     this._totalAccruedBase = this.totalElapsedMs;
+    var savedMode = storageGet(MODE_KEY, 'normal');
+    this.mode = savedMode === 'timed' ? 'timed' : 'normal';
 
     this.levelIndex = Math.min(Math.max(0, this.maxUnlocked - 1), LEVELS.length - 1);
-    this.screen = 'title'; // title | playing | clear
+    this.screen = 'title'; // title | playing | clear | fail
     this.state = 'title';
     this.board = null;
     this.cell = 0;
@@ -129,10 +157,15 @@
     this.messageUntil = 0;
     this.levelStartedAt = 0;
     this.levelElapsedMs = 0;
+    this.levelRemainingMs = 0;
+    this.levelTimeLimitMs = 0;
     this.levelTimerFrozen = false;
     this.clearBurstAt = 0;
+    this.failAt = 0;
     this.titlePulse = 0;
+    this._newBest = false;
     this._audio = null;
+    this._urgentBeepAt = 0;
 
     this._bindInput();
     this._running = true;
@@ -164,20 +197,21 @@
 
   FrontPathGame.prototype._layout = function () {
     if (!this.board || this.screen === 'title') return;
-    var padX = Math.max(10, Math.floor(this.width * 0.03));
-    var header = Math.max(78, Math.min(100, Math.floor(this.height * 0.12)));
-    var footer = Math.max(78, Math.min(110, Math.floor(this.height * 0.13)));
+    // Portrait-first: thinner side padding, taller usable board area
+    var padX = Math.max(8, Math.floor(this.width * 0.025));
+    var header = Math.max(88, Math.min(118, Math.floor(this.height * 0.13)));
+    var footer = Math.max(72, Math.min(100, Math.floor(this.height * 0.11)));
     var availW = this.width - padX * 2;
     var availH = this.height - header - footer;
     var cell = Math.floor(Math.min(availW / this.board.w, availH / this.board.h));
-    var minCell = this.board.w >= 12 || this.board.h >= 12 ? 18 : 26;
-    this.cell = Math.max(minCell, Math.min(cell, 88));
+    var minCell = this.board.h >= 16 ? 16 : this.board.h >= 12 ? 18 : 24;
+    this.cell = Math.max(minCell, Math.min(cell, 72));
     var boardW = this.cell * this.board.w;
     var boardH = this.cell * this.board.h;
     this.originX = Math.floor((this.width - boardW) / 2);
     this.originY = Math.floor(header + Math.max(0, (availH - boardH) / 2));
     this.headerY = 16;
-    this.footerY = this.height - Math.max(62, footer - 12);
+    this.footerY = this.height - Math.max(58, footer - 10);
   };
 
   FrontPathGame.prototype.loadLevel = function (index) {
@@ -192,8 +226,13 @@
     this.message = '';
     this.levelStartedAt = performanceNow();
     this.levelElapsedMs = 0;
+    this.levelTimeLimitMs = timeLimitFor(this.board);
+    this.levelRemainingMs = this.levelTimeLimitMs;
     this.levelTimerFrozen = false;
     this.clearBurstAt = 0;
+    this.failAt = 0;
+    this._newBest = false;
+    this._urgentBeepAt = 0;
     this._layout();
   };
 
@@ -247,6 +286,23 @@
         g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
         o.start(t0);
         o.stop(t0 + 0.36);
+      } else if (kind === 'fail') {
+        o.type = 'sawtooth';
+        o.frequency.setValueAtTime(220, t0);
+        o.frequency.exponentialRampToValueAtTime(70, t0 + 0.28);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.05, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.3);
+        o.start(t0);
+        o.stop(t0 + 0.32);
+      } else if (kind === 'urgent') {
+        o.type = 'square';
+        o.frequency.setValueAtTime(880, t0);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.035, t0 + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
+        o.start(t0);
+        o.stop(t0 + 0.09);
       } else if (kind === 'tap') {
         o.type = 'sine';
         o.frequency.setValueAtTime(660, t0);
@@ -361,10 +417,23 @@
     return best;
   };
 
+  FrontPathGame.prototype._setMode = function (mode) {
+    this.mode = mode === 'timed' ? 'timed' : 'normal';
+    storageSet(MODE_KEY, this.mode);
+  };
+
   FrontPathGame.prototype._onTap = function (x, y) {
     var btn = this._hitButton(x, y);
     if (btn) {
       this._beep('tap');
+      if (btn.id === 'mode_normal') {
+        this._setMode('normal');
+        return;
+      }
+      if (btn.id === 'mode_timed') {
+        this._setMode('timed');
+        return;
+      }
       if (btn.id === 'play') {
         this.loadLevel(0);
         return;
@@ -411,6 +480,7 @@
     }
 
     if (this.screen === 'title') return;
+    if (this.state === 'fail') return;
     if (this.state !== 'playing') return;
     if (!this.board) return;
 
@@ -464,6 +534,31 @@
     }
   };
 
+  FrontPathGame.prototype._recordBest = function () {
+    var id = String(this.board.id);
+    if (this.mode === 'timed') {
+      // Best = most time remaining (higher is better)
+      var rem = Math.max(0, this.levelRemainingMs);
+      var prev = this.bestTimesTimed[id];
+      if (prev == null || rem > prev) {
+        this.bestTimesTimed[id] = rem;
+        storageSet(BEST_TIMED_KEY, this.bestTimesTimed);
+        this._newBest = true;
+      } else {
+        this._newBest = false;
+      }
+    } else {
+      var prevN = this.bestTimes[id];
+      if (prevN == null || this.levelElapsedMs < prevN) {
+        this.bestTimes[id] = this.levelElapsedMs;
+        storageSet(BEST_KEY, this.bestTimes);
+        this._newBest = true;
+      } else {
+        this._newBest = false;
+      }
+    }
+  };
+
   FrontPathGame.prototype._checkClear = function () {
     if (this.state !== 'playing') return;
     var idle = this.board.arrows.filter(function (a) {
@@ -479,19 +574,14 @@
       this.messageUntil = performanceNow() + 2500;
       if (!this.levelTimerFrozen) {
         this.levelElapsedMs = Math.max(0, performanceNow() - this.levelStartedAt);
+        if (this.mode === 'timed') {
+          this.levelRemainingMs = Math.max(0, this.levelTimeLimitMs - this.levelElapsedMs);
+        }
         this.levelTimerFrozen = true;
         this.totalElapsedMs = this._totalAccruedBase + this.levelElapsedMs;
         this._totalAccruedBase = this.totalElapsedMs;
         storageSet(TOTAL_KEY, this.totalElapsedMs);
-        var id = String(this.board.id);
-        var prev = this.bestTimes[id];
-        if (prev == null || this.levelElapsedMs < prev) {
-          this.bestTimes[id] = this.levelElapsedMs;
-          storageSet(BEST_KEY, this.bestTimes);
-          this._newBest = true;
-        } else {
-          this._newBest = false;
-        }
+        this._recordBest();
       }
       var unlocked = Math.max(this.maxUnlocked, this.levelIndex + 2);
       this.maxUnlocked = Math.min(unlocked, LEVELS.length);
@@ -502,8 +592,20 @@
     }
   };
 
+  FrontPathGame.prototype._triggerFail = function () {
+    if (this.state !== 'playing') return;
+    this.state = 'fail';
+    this.screen = 'fail';
+    this.levelTimerFrozen = true;
+    this.levelRemainingMs = 0;
+    this.failAt = performanceNow();
+    this.anims = [];
+    this._beep('fail');
+  };
+
   FrontPathGame.prototype._trySlide = function (arrow) {
     if (!arrow || arrow.departing) return;
+    if (this.state !== 'playing') return;
     var result = this._pathClear(arrow);
     if (!result.ok) {
       this.flash = { arrow: arrow, until: performanceNow() + 220, kind: 'blocked' };
@@ -554,6 +656,18 @@
     this.titlePulse = ts;
     if (!this.levelTimerFrozen && this.state === 'playing' && this.levelStartedAt) {
       this.levelElapsedMs = Math.max(0, ts - this.levelStartedAt);
+      if (this.mode === 'timed') {
+        this.levelRemainingMs = Math.max(0, this.levelTimeLimitMs - this.levelElapsedMs);
+        if (this.levelRemainingMs <= 0) {
+          this._triggerFail();
+        } else if (this.levelRemainingMs <= 5000) {
+          // Soft tick every ~0.8s under 5s
+          if (!this._urgentBeepAt || ts - this._urgentBeepAt > 800) {
+            this._urgentBeepAt = ts;
+            this._beep('urgent');
+          }
+        }
+      }
     }
     var list = this.anims.slice();
     for (var i = 0; i < list.length; i++) {
@@ -587,11 +701,10 @@
     g.addColorStop(1, COLORS.bg1);
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, w, h);
-    // soft vignette dots
     ctx.fillStyle = 'rgba(90,208,255,0.03)';
     for (var i = 0; i < 12; i++) {
-      var rx = ((i * 97) % w);
-      var ry = ((i * 53) % h);
+      var rx = (i * 97) % w;
+      var ry = (i * 53) % h;
       ctx.beginPath();
       ctx.arc(rx, ry, 40 + (i % 5) * 10, 0, Math.PI * 2);
       ctx.fill();
@@ -613,7 +726,6 @@
 
     this._drawPlay(ctx, w, h, ts);
 
-    // particles on top
     for (var i = 0; i < this.particles.length; i++) {
       var pt = this.particles[i];
       var a = 1 - pt.age / pt.life;
@@ -632,81 +744,169 @@
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = COLORS.text;
-    ctx.font = 'bold 42px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Front Path', w / 2, h * 0.22);
+    ctx.font = 'bold 40px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Front Path', w / 2, h * 0.12);
 
     ctx.fillStyle = COLORS.muted;
-    ctx.font = '15px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Slide arrows off the board · plan the order', w / 2, h * 0.22 + 36);
+    ctx.font = '14px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Slide arrows off the board · plan the order', w / 2, h * 0.12 + 32);
 
-    // decorative arrow row
-    var demoY = h * 0.38;
+    var demoY = h * 0.24;
     var dirs = ['L', 'U', 'R', 'D'];
     for (var i = 0; i < 4; i++) {
-      this._drawArrowAt(ctx, w / 2 + (i - 1.5) * 56, demoY, dirs[i], COLORS.arrow, 0.75 + pulse * 0.25, 0, 44);
+      this._drawArrowAt(ctx, w / 2 + (i - 1.5) * 52, demoY, dirs[i], COLORS.arrow, 0.75 + pulse * 0.25, 0, 40);
     }
 
     var cleared = 0;
-    for (var k in this.bestTimes) if (Object.prototype.hasOwnProperty.call(this.bestTimes, k)) cleared++;
+    var bestMap = this.mode === 'timed' ? this.bestTimesTimed : this.bestTimes;
+    for (var k in bestMap) if (Object.prototype.hasOwnProperty.call(bestMap, k)) cleared++;
 
     ctx.fillStyle = COLORS.accent;
-    ctx.font = '13px system-ui, -apple-system, sans-serif';
+    ctx.font = '12px system-ui, -apple-system, sans-serif';
     ctx.fillText(
-      LEVELS.length + ' levels · ' + Math.max(0, this.maxUnlocked - 1) + ' cleared · best records ' + cleared,
+      LEVELS.length + ' levels · ' + Math.max(0, this.maxUnlocked - 1) + ' cleared · records ' + cleared,
       w / 2,
-      h * 0.48
+      h * 0.32
     );
 
-    var bw = Math.min(220, w - 48);
+    // Mode select
+    ctx.fillStyle = COLORS.muted;
+    ctx.font = '13px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Choose mode', w / 2, h * 0.38);
+
+    var gap = 12;
+    var modeW = Math.min(150, (w - 48 - gap) / 2);
+    var modeH = 64;
+    var modeY = h * 0.42;
+    var leftX = w / 2 - modeW - gap / 2;
+    var rightX = w / 2 + gap / 2;
+
+    this._drawModeCard(ctx, leftX, modeY, modeW, modeH, 'Normal', 'No limit · stopwatch', 'mode_normal', this.mode === 'normal');
+    this._drawModeCard(ctx, rightX, modeY, modeW, modeH, 'Timed', 'Countdown · urgency', 'mode_timed', this.mode === 'timed');
+
+    var bw = Math.min(240, w - 48);
     var bh = 52;
     var bx = (w - bw) / 2;
-    this._drawBtn(ctx, bx, h * 0.56, bw, bh, this.maxUnlocked > 1 ? 'Continue' : 'Play', this.maxUnlocked > 1 ? 'continue' : 'play', false, true);
+    var playY = modeY + modeH + 28;
+    this._drawBtn(ctx, bx, playY, bw, bh, this.maxUnlocked > 1 ? 'Continue' : 'Play', this.maxUnlocked > 1 ? 'continue' : 'play', false, true);
     if (this.maxUnlocked > 1) {
-      this._drawBtn(ctx, bx, h * 0.56 + 64, bw, bh, 'Play from Level 1', 'play', false, false);
+      this._drawBtn(ctx, bx, playY + 64, bw, bh, 'Play from Level 1', 'play', false, false);
     }
-    this._drawBtn(ctx, bx, h * 0.56 + (this.maxUnlocked > 1 ? 128 : 64), bw, 44, this.soundOn ? 'Sound: On' : 'Sound: Off', 'sound', false, false);
+    var soundY = playY + (this.maxUnlocked > 1 ? 128 : 64);
+    this._drawBtn(ctx, bx, soundY, bw, 44, this.soundOn ? 'Sound: On' : 'Sound: Off', 'sound', false, false);
 
     ctx.fillStyle = COLORS.muted;
     ctx.font = '12px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Tap arrows anytime — no waiting for slides', w / 2, h - 36);
+    ctx.fillText(
+      this.mode === 'timed' ? 'Beat the clock on every level' : 'Take your time · chase best times',
+      w / 2,
+      h - 36
+    );
+  };
+
+  FrontPathGame.prototype._drawModeCard = function (ctx, x, y, bw, bh, title, sub, id, selected) {
+    this.buttons.push({ x: x, y: y, w: bw, h: bh, id: id, disabled: false });
+    roundRect(ctx, x, y, bw, bh, 14);
+    if (selected) {
+      var g = ctx.createLinearGradient(x, y, x, y + bh);
+      g.addColorStop(0, '#3a8be0');
+      g.addColorStop(1, COLORS.btnPrimary);
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = COLORS.btn;
+    }
+    ctx.fill();
+    ctx.strokeStyle = selected ? COLORS.btnPrimaryEdge : COLORS.btnEdge;
+    ctx.lineWidth = selected ? 2 : 1.2;
+    ctx.stroke();
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = COLORS.text;
+    ctx.font = 'bold 16px system-ui, -apple-system, sans-serif';
+    ctx.fillText(title, x + bw / 2, y + bh / 2 - 10);
+    ctx.fillStyle = selected ? 'rgba(255,255,255,0.85)' : COLORS.muted;
+    ctx.font = '11px system-ui, -apple-system, sans-serif';
+    ctx.fillText(sub, x + bw / 2, y + bh / 2 + 12);
   };
 
   FrontPathGame.prototype._drawPlay = function (ctx, w, h, ts) {
     var lv = this.board;
-    var best = this.bestTimes[String(lv.id)];
+    var bestMap = this.mode === 'timed' ? this.bestTimesTimed : this.bestTimes;
+    var best = bestMap[String(lv.id)];
 
     // HUD top
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
     ctx.fillStyle = COLORS.text;
-    ctx.font = 'bold 20px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Front Path', 18, 14);
+    ctx.font = 'bold 18px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Front Path', 16, 12);
 
     ctx.fillStyle = COLORS.muted;
-    ctx.font = '13px system-ui, -apple-system, sans-serif';
-    ctx.fillText('Lv ' + lv.id + ' / ' + LEVELS.length + '  ·  ' + lv.name, 18, 40);
+    ctx.font = '12px system-ui, -apple-system, sans-serif';
+    ctx.fillText(
+      'Lv ' + lv.id + '/' + LEVELS.length + ' · ' + lv.name + ' · ' + lv.w + '×' + lv.h,
+      16,
+      36
+    );
 
     var leftCount = 0;
     for (var li = 0; li < lv.arrows.length; li++) if (!lv.arrows[li].departing) leftCount++;
 
+    // Timer display
     ctx.textAlign = 'right';
-    ctx.fillStyle = this.levelTimerFrozen ? COLORS.arrowOk : COLORS.text;
-    ctx.font = 'bold 22px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText(formatTime(this.levelElapsedMs), w - 18, 12);
-    ctx.fillStyle = COLORS.muted;
-    ctx.font = '11px system-ui, -apple-system, sans-serif';
-    ctx.fillText(this.levelTimerFrozen ? 'cleared' : 'level time', w - 18, 36);
+    if (this.mode === 'timed') {
+      var rem = this.levelRemainingMs;
+      var urgent = rem <= 5000 && this.state === 'playing';
+      var critical = rem <= 3000 && this.state === 'playing';
+      ctx.fillStyle = this.state === 'fail' ? COLORS.danger : critical ? COLORS.danger : urgent ? COLORS.warn : COLORS.accent;
+      ctx.font = 'bold 26px ui-monospace, SFMono-Regular, Menlo, monospace';
+      // pulse when urgent
+      if (urgent && this.state === 'playing') {
+        var p = 0.85 + 0.15 * Math.sin(ts / 120);
+        ctx.globalAlpha = p;
+      }
+      ctx.fillText(formatCountdown(rem), w - 16, 10);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = COLORS.muted;
+      ctx.font = '11px system-ui, -apple-system, sans-serif';
+      ctx.fillText(this.state === 'fail' ? 'time up' : this.levelTimerFrozen ? 'left' : 'countdown', w - 16, 40);
+
+      // countdown bar under HUD
+      var barW = Math.min(w - 32, 220);
+      var barX = w - 16 - barW;
+      var barY = 56;
+      var pct = this.levelTimeLimitMs > 0 ? Math.max(0, Math.min(1, rem / this.levelTimeLimitMs)) : 0;
+      roundRect(ctx, barX, barY, barW, 6, 3);
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      ctx.fill();
+      roundRect(ctx, barX, barY, Math.max(2, barW * pct), 6, 3);
+      ctx.fillStyle = critical ? COLORS.danger : urgent ? COLORS.warn : COLORS.accent;
+      ctx.fill();
+    } else {
+      ctx.fillStyle = this.levelTimerFrozen ? COLORS.arrowOk : COLORS.text;
+      ctx.font = 'bold 22px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillText(formatTime(this.levelElapsedMs), w - 16, 10);
+      ctx.fillStyle = COLORS.muted;
+      ctx.font = '11px system-ui, -apple-system, sans-serif';
+      ctx.fillText(this.levelTimerFrozen ? 'cleared' : 'level time', w - 16, 36);
+    }
 
     ctx.textAlign = 'left';
     ctx.fillStyle = COLORS.accent;
     ctx.font = '12px system-ui, -apple-system, sans-serif';
-    var bestLabel = best != null ? 'Best ' + formatTime(best) : 'Best —';
-    ctx.fillText(bestLabel + '   ·   ' + leftCount + ' left', 18, 58);
+    var bestLabel;
+    if (this.mode === 'timed') {
+      bestLabel = best != null ? 'Best left ' + formatCountdown(best) : 'Best —';
+    } else {
+      bestLabel = best != null ? 'Best ' + formatTime(best) : 'Best —';
+    }
+    ctx.fillText(bestLabel + '   ·   ' + leftCount + ' left', 16, this.mode === 'timed' ? 68 : 56);
 
     // Board panel
     var boardW = this.cell * lv.w;
     var boardH = this.cell * lv.h;
-    roundRect(ctx, this.originX - 10, this.originY - 10, boardW + 20, boardH + 20, 16);
+    roundRect(ctx, this.originX - 8, this.originY - 8, boardW + 16, boardH + 16, 14);
     ctx.fillStyle = COLORS.panel;
     ctx.fill();
     ctx.strokeStyle = COLORS.panelEdge;
@@ -718,13 +918,12 @@
         var cx = this.originX + x * this.cell;
         var cy = this.originY + y * this.cell;
         var pad = Math.max(2, Math.floor(this.cell * 0.08));
-        roundRect(ctx, cx + pad, cy + pad, this.cell - pad * 2, this.cell - pad * 2, Math.min(10, this.cell * 0.22));
+        roundRect(ctx, cx + pad, cy + pad, this.cell - pad * 2, this.cell - pad * 2, Math.min(8, this.cell * 0.2));
         ctx.fillStyle = (x + y) % 2 === 0 ? COLORS.cell : COLORS.cellHi;
         ctx.fill();
       }
     }
 
-    // Arrows
     for (var i = 0; i < lv.arrows.length; i++) {
       var a = lv.arrows[i];
       var drawX = a.x;
@@ -760,12 +959,11 @@
       this._drawArrow(ctx, drawX, drawY, a.d, color, alpha, shake);
     }
 
-    // Transient message
     if (this.message && ts < this.messageUntil && this.state === 'playing') {
       ctx.fillStyle = COLORS.arrowBlocked;
       ctx.font = 'bold 15px system-ui, -apple-system, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(this.message, w / 2, this.originY - 16);
+      ctx.fillText(this.message, w / 2, this.originY - 14);
     }
 
     // Clear overlay
@@ -778,16 +976,41 @@
       ctx.textBaseline = 'middle';
       ctx.fillStyle = COLORS.arrowOk;
       ctx.font = 'bold 40px system-ui, -apple-system, sans-serif';
-      ctx.fillText('Clear!', w / 2, h / 2 - 54);
+      ctx.fillText('Clear!', w / 2, h / 2 - 58);
 
       ctx.fillStyle = COLORS.text;
       ctx.font = 'bold 26px ui-monospace, SFMono-Regular, Menlo, monospace';
-      ctx.fillText(formatTime(this.levelElapsedMs), w / 2, h / 2 - 10);
+      if (this.mode === 'timed') {
+        ctx.fillText(formatCountdown(this.levelRemainingMs) + ' left', w / 2, h / 2 - 12);
+      } else {
+        ctx.fillText(formatTime(this.levelElapsedMs), w / 2, h / 2 - 12);
+      }
 
       ctx.fillStyle = this._newBest ? COLORS.accent : COLORS.muted;
       ctx.font = '14px system-ui, -apple-system, sans-serif';
-      var bestLine = best != null ? 'Best ' + formatTime(this.bestTimes[String(lv.id)]) : '';
-      ctx.fillText(this._newBest ? 'New best time!' : bestLine, w / 2, h / 2 + 18);
+      var bestLine = '';
+      if (this.mode === 'timed') {
+        var bt = this.bestTimesTimed[String(lv.id)];
+        bestLine = bt != null ? 'Best left ' + formatCountdown(bt) : '';
+      } else {
+        var bn = this.bestTimes[String(lv.id)];
+        bestLine = bn != null ? 'Best ' + formatTime(bn) : '';
+      }
+      ctx.fillText(this._newBest ? 'New best!' : bestLine, w / 2, h / 2 + 18);
+    }
+
+    // Fail overlay
+    if (this.state === 'fail') {
+      ctx.fillStyle = 'rgba(11,16,23,0.62)';
+      ctx.fillRect(0, 0, w, h);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = COLORS.danger;
+      ctx.font = 'bold 38px system-ui, -apple-system, sans-serif';
+      ctx.fillText("Time's up!", w / 2, h / 2 - 36);
+      ctx.fillStyle = COLORS.muted;
+      ctx.font = '14px system-ui, -apple-system, sans-serif';
+      ctx.fillText('Retry and beat the countdown', w / 2, h / 2);
     }
 
     // Footer buttons
@@ -795,7 +1018,7 @@
     var btnH = 46;
     var gap = 10;
     var btnW = Math.min(108, (w - 36 - gap * 2) / 3);
-    this._drawBtn(ctx, 16, btnY, btnW, btnH, 'Retry', 'retry');
+    this._drawBtn(ctx, 16, btnY, btnW, btnH, 'Retry', 'retry', false, this.state === 'fail');
     var midX = (w - btnW) / 2;
     if (this.levelIndex > 0) this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Prev', 'prev');
     else this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Menu', 'menu');
@@ -807,7 +1030,17 @@
           : 'Menu'
         : 'Next';
     var nextEnabled = this.state === 'clear' || this.levelIndex + 1 < this.maxUnlocked;
-    this._drawBtn(ctx, w - 16 - btnW, btnY, btnW, btnH, nextLabel, 'next', !nextEnabled && this.state !== 'clear', this.state === 'clear');
+    this._drawBtn(
+      ctx,
+      w - 16 - btnW,
+      btnY,
+      btnW,
+      btnH,
+      nextLabel,
+      'next',
+      !nextEnabled && this.state !== 'clear',
+      this.state === 'clear'
+    );
   };
 
   FrontPathGame.prototype._drawBtn = function (ctx, x, y, bw, bh, label, id, disabled, primary) {
@@ -846,13 +1079,11 @@
     var rot = { U: -Math.PI / 2, D: Math.PI / 2, L: Math.PI, R: 0 }[dir];
     ctx.rotate(rot);
 
-    // glow
     ctx.beginPath();
     ctx.arc(0, 0, cell * 0.4, 0, Math.PI * 2);
     ctx.fillStyle = COLORS.glow;
     ctx.fill();
 
-    // body
     ctx.beginPath();
     ctx.arc(0, 0, cell * 0.34, 0, Math.PI * 2);
     var g = ctx.createRadialGradient(-cell * 0.1, -cell * 0.1, 2, 0, 0, cell * 0.34);
@@ -868,7 +1099,6 @@
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // chevron
     ctx.fillStyle = '#071018';
     ctx.beginPath();
     ctx.moveTo(s * 0.9, 0);
