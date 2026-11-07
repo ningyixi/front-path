@@ -1,25 +1,35 @@
 /**
- * Front Path — shared canvas path-puzzle engine.
- * Works in WeChat mini-game (wx) and browser (Canvas + localStorage).
- * multi-anim v4 + timer: no global lock; departing arrows free hits immediately.
+ * Front Path — polished path-puzzle engine (WeChat + browser).
+ * multi-anim v5: concurrent slides, level timer, best times, start screen.
  */
 (function (root) {
   const { LEVELS, D } = root.FrontPathLevels;
 
   const COLORS = {
-    bg: '#0f1419',
-    panel: '#1a2332',
-    grid: '#243044',
-    cell: '#1e2a3a',
-    arrow: '#4fc3f7',
-    arrowBlocked: '#ef5350',
-    arrowOk: '#66bb6a',
-    text: '#e8eef7',
-    muted: '#8a9bb0',
-    accent: '#ffb74d',
-    btn: '#2a3a52',
-    btnHover: '#3a4f6e',
+    bg0: '#0b1017',
+    bg1: '#121a24',
+    panel: '#162033',
+    panelEdge: '#2a3d5a',
+    cell: '#1a2740',
+    cellHi: '#203050',
+    arrow: '#5ad0ff',
+    arrowDeep: '#2a9fd6',
+    arrowBlocked: '#ff6b6b',
+    arrowOk: '#6ee7a8',
+    text: '#eef3fb',
+    muted: '#8fa3bc',
+    accent: '#ffc857',
+    btn: '#243652',
+    btnEdge: '#3d5a80',
+    btnPrimary: '#2f7dd1',
+    btnPrimaryEdge: '#5eb0ff',
+    glow: 'rgba(90,208,255,0.35)',
   };
+
+  const BEST_KEY = 'front_path_best_times';
+  const UNLOCK_KEY = 'front_path_max_unlocked';
+  const TOTAL_KEY = 'front_path_total_ms';
+  const SOUND_KEY = 'front_path_sound';
 
   function cloneLevel(level) {
     return {
@@ -27,25 +37,27 @@
       name: level.name,
       w: level.w,
       h: level.h,
-      arrows: level.arrows.map((a) => ({ x: a.x, y: a.y, d: a.d, id: a.x + ',' + a.y + ',' + a.d })),
+      arrows: level.arrows.map(function (a) {
+        return { x: a.x, y: a.y, d: a.d, id: a.x + ',' + a.y + ',' + a.d };
+      }),
     };
   }
 
   function storageGet(key, fallback) {
     try {
       if (typeof wx !== 'undefined' && wx.getStorageSync) {
-        const v = wx.getStorageSync(key);
+        var v = wx.getStorageSync(key);
         return v === '' || v === undefined || v === null ? fallback : v;
       }
     } catch (e) {}
     try {
       if (typeof localStorage !== 'undefined') {
-        const v = localStorage.getItem(key);
-        if (v === null) return fallback;
+        var v2 = localStorage.getItem(key);
+        if (v2 === null) return fallback;
         try {
-          return JSON.parse(v);
+          return JSON.parse(v2);
         } catch (_) {
-          return v;
+          return v2;
         }
       }
     } catch (e) {}
@@ -66,6 +78,26 @@
     } catch (e) {}
   }
 
+  function performanceNow() {
+    if (typeof performance !== 'undefined' && performance.now) return performance.now();
+    return Date.now();
+  }
+
+  function formatTime(ms) {
+    ms = Math.max(0, Math.floor(ms || 0));
+    var totalSec = Math.floor(ms / 1000);
+    var m = Math.floor(totalSec / 60);
+    var sec = totalSec % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
+  }
+
+  function easeOutCubic(t) {
+    return 1 - Math.pow(1 - t, 3);
+  }
+  function easeIn(t) {
+    return t * t;
+  }
+
   function FrontPathGame(canvas, opts) {
     opts = opts || {};
     this.canvas = canvas;
@@ -74,14 +106,23 @@
     this.width = 0;
     this.height = 0;
 
-    this.maxUnlocked = Number(storageGet('front_path_max_unlocked', 1)) || 1;
-    this.levelIndex = Math.min(this.maxUnlocked, LEVELS.length) - 1;
-    this.state = null; // playing | clear
+    this.maxUnlocked = Number(storageGet(UNLOCK_KEY, 1)) || 1;
+    if (this.maxUnlocked > LEVELS.length) this.maxUnlocked = LEVELS.length;
+    this.bestTimes = storageGet(BEST_KEY, {}) || {};
+    if (typeof this.bestTimes !== 'object') this.bestTimes = {};
+    this.soundOn = storageGet(SOUND_KEY, true) !== false;
+    this.totalElapsedMs = Number(storageGet(TOTAL_KEY, 0)) || 0;
+    this._totalAccruedBase = this.totalElapsedMs;
+
+    this.levelIndex = Math.min(Math.max(0, this.maxUnlocked - 1), LEVELS.length - 1);
+    this.screen = 'title'; // title | playing | clear
+    this.state = 'title';
     this.board = null;
     this.cell = 0;
     this.originX = 0;
     this.originY = 0;
-    this.anims = []; // concurrent slide/shake animations
+    this.anims = [];
+    this.particles = [];
     this.flash = null;
     this.buttons = [];
     this.message = '';
@@ -89,10 +130,10 @@
     this.levelStartedAt = 0;
     this.levelElapsedMs = 0;
     this.levelTimerFrozen = false;
-    this.totalElapsedMs = Number(storageGet('front_path_total_ms', 0)) || 0;
-    this._totalAccruedBase = this.totalElapsedMs;
+    this.clearBurstAt = 0;
+    this.titlePulse = 0;
+    this._audio = null;
 
-    this.loadLevel(this.levelIndex);
     this._bindInput();
     this._running = true;
     this._last = 0;
@@ -122,52 +163,111 @@
   };
 
   FrontPathGame.prototype._layout = function () {
-    if (!this.board) return;
-    // Use most of the viewport: thin chrome, large cells, roomy boards.
-    const padX = Math.max(8, Math.floor(this.width * 0.02));
-    const padY = 8;
-    const header = Math.max(64, Math.min(84, Math.floor(this.height * 0.1)));
-    const footer = Math.max(72, Math.min(96, Math.floor(this.height * 0.12)));
-    const availW = this.width - padX * 2;
-    const availH = this.height - header - footer - padY;
-    let cell = Math.floor(Math.min(availW / this.board.w, availH / this.board.h));
-    // Prefer filling the screen; allow big cells on phones/tablets and huge boards.
-    const minCell = this.board.w >= 10 || this.board.h >= 10 ? 22 : 28;
-    const maxCell = 96;
-    this.cell = Math.max(minCell, Math.min(cell, maxCell));
-    const boardW = this.cell * this.board.w;
-    const boardH = this.cell * this.board.h;
+    if (!this.board || this.screen === 'title') return;
+    var padX = Math.max(10, Math.floor(this.width * 0.03));
+    var header = Math.max(78, Math.min(100, Math.floor(this.height * 0.12)));
+    var footer = Math.max(78, Math.min(110, Math.floor(this.height * 0.13)));
+    var availW = this.width - padX * 2;
+    var availH = this.height - header - footer;
+    var cell = Math.floor(Math.min(availW / this.board.w, availH / this.board.h));
+    var minCell = this.board.w >= 12 || this.board.h >= 12 ? 18 : 26;
+    this.cell = Math.max(minCell, Math.min(cell, 88));
+    var boardW = this.cell * this.board.w;
+    var boardH = this.cell * this.board.h;
     this.originX = Math.floor((this.width - boardW) / 2);
     this.originY = Math.floor(header + Math.max(0, (availH - boardH) / 2));
-    this.headerY = Math.max(16, Math.floor(header * 0.28));
-    this.footerY = this.height - Math.max(56, footer - 16);
+    this.headerY = 16;
+    this.footerY = this.height - Math.max(62, footer - 12);
   };
 
   FrontPathGame.prototype.loadLevel = function (index) {
     index = Math.max(0, Math.min(index, LEVELS.length - 1));
     this.levelIndex = index;
     this.board = cloneLevel(LEVELS[index]);
+    this.screen = 'playing';
     this.state = 'playing';
     this.anims = [];
+    this.particles = [];
     this.flash = null;
     this.message = '';
     this.levelStartedAt = performanceNow();
     this.levelElapsedMs = 0;
     this.levelTimerFrozen = false;
+    this.clearBurstAt = 0;
     this._layout();
   };
 
+  FrontPathGame.prototype._ensureAudio = function () {
+    if (this._audio) return this._audio;
+    try {
+      var AC = root.AudioContext || root.webkitAudioContext;
+      if (!AC) return null;
+      this._audio = new AC();
+    } catch (e) {
+      return null;
+    }
+    return this._audio;
+  };
+
+  FrontPathGame.prototype._beep = function (kind) {
+    if (!this.soundOn) return;
+    var ac = this._ensureAudio();
+    if (!ac) return;
+    try {
+      if (ac.state === 'suspended') ac.resume();
+      var t0 = ac.currentTime;
+      var o = ac.createOscillator();
+      var g = ac.createGain();
+      o.connect(g);
+      g.connect(ac.destination);
+      if (kind === 'slide') {
+        o.type = 'sine';
+        o.frequency.setValueAtTime(520, t0);
+        o.frequency.exponentialRampToValueAtTime(280, t0 + 0.12);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.05, t0 + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.14);
+        o.start(t0);
+        o.stop(t0 + 0.15);
+      } else if (kind === 'block') {
+        o.type = 'triangle';
+        o.frequency.setValueAtTime(160, t0);
+        o.frequency.exponentialRampToValueAtTime(90, t0 + 0.1);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.06, t0 + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
+        o.start(t0);
+        o.stop(t0 + 0.13);
+      } else if (kind === 'clear') {
+        o.type = 'sine';
+        o.frequency.setValueAtTime(440, t0);
+        o.frequency.exponentialRampToValueAtTime(880, t0 + 0.22);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.07, t0 + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.35);
+        o.start(t0);
+        o.stop(t0 + 0.36);
+      } else if (kind === 'tap') {
+        o.type = 'sine';
+        o.frequency.setValueAtTime(660, t0);
+        g.gain.setValueAtTime(0.0001, t0);
+        g.gain.exponentialRampToValueAtTime(0.03, t0 + 0.005);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.06);
+        o.start(t0);
+        o.stop(t0 + 0.07);
+      }
+    } catch (e) {}
+  };
+
   FrontPathGame.prototype._bindInput = function () {
-    const self = this;
+    var self = this;
     this._lastPointerId = null;
     this._lastTapAt = 0;
     this._lastTapKey = '';
 
-    const onDown = function (x, y, pointerId) {
-      // Deduplicate touchstart+mousedown / pointer+mouse for the SAME gesture only.
-      // Never block a tap on a different arrow.
-      const now = performanceNow();
-      const key = Math.round(x) + ':' + Math.round(y);
+    var onDown = function (x, y, pointerId) {
+      var now = performanceNow();
+      var key = Math.round(x) + ':' + Math.round(y);
       if (pointerId != null && pointerId === self._lastPointerId && now - self._lastTapAt < 40) return;
       if (key === self._lastTapKey && now - self._lastTapAt < 40) return;
       self._lastPointerId = pointerId;
@@ -178,19 +278,19 @@
 
     if (typeof wx !== 'undefined' && wx.onTouchStart) {
       wx.onTouchStart(function (e) {
-        const touches = e.changedTouches || e.touches || [];
-        for (let i = 0; i < touches.length; i++) {
-          const t = touches[i];
+        var touches = e.changedTouches || e.touches || [];
+        for (var i = 0; i < touches.length; i++) {
+          var t = touches[i];
           onDown(t.clientX, t.clientY, t.identifier);
         }
       });
       return;
     }
 
-    const el = this.canvas;
-    const toLocal = function (e) {
-      const rect = el.getBoundingClientRect();
-      let clientX, clientY, pid = null;
+    var el = this.canvas;
+    var toLocal = function (e) {
+      var rect = el.getBoundingClientRect();
+      var clientX, clientY, pid = null;
       if (e.changedTouches && e.changedTouches[0]) {
         clientX = e.changedTouches[0].clientX;
         clientY = e.changedTouches[0].clientY;
@@ -207,14 +307,12 @@
       return { x: clientX - rect.left, y: clientY - rect.top, pid: pid };
     };
 
-    const handler = function (e) {
-      // Always handle; never wait on animations.
+    var handler = function (e) {
       if (e.cancelable) e.preventDefault();
-      const p = toLocal(e);
+      var p = toLocal(e);
       onDown(p.x, p.y, p.pid);
     };
 
-    // Prefer pointerdown (mouse + touch + pen). Keep touchstart/mousedown as fallback.
     if (typeof window !== 'undefined' && window.PointerEvent) {
       el.addEventListener('pointerdown', handler, { passive: false });
     } else {
@@ -224,8 +322,9 @@
   };
 
   FrontPathGame.prototype._hitButton = function (x, y) {
-    for (let i = 0; i < this.buttons.length; i++) {
-      const b = this.buttons[i];
+    for (var i = 0; i < this.buttons.length; i++) {
+      var b = this.buttons[i];
+      if (b.disabled) continue;
       if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return b;
     }
     return null;
@@ -234,27 +333,26 @@
   FrontPathGame.prototype._isSliding = function (arrow) {
     if (!arrow) return false;
     if (arrow.departing) return true;
-    for (let i = 0; i < this.anims.length; i++) {
+    for (var i = 0; i < this.anims.length; i++) {
       if (this.anims[i].type === 'slide' && this.anims[i].arrow === arrow) return true;
     }
     return false;
   };
 
-  /** Nearest idle (non-departing) arrow; generous touch radius. */
   FrontPathGame.prototype._hitArrow = function (x, y) {
-    const cell = this.cell || 1;
-    const radius = cell * 0.72; // large touch target
-    const r2 = radius * radius;
-    let best = null;
-    let bestDist = r2;
-    for (let i = 0; i < this.board.arrows.length; i++) {
-      const a = this.board.arrows[i];
+    var cell = this.cell || 1;
+    var radius = cell * 0.75;
+    var r2 = radius * radius;
+    var best = null;
+    var bestDist = r2;
+    for (var i = 0; i < this.board.arrows.length; i++) {
+      var a = this.board.arrows[i];
       if (a.departing) continue;
-      const cx = this.originX + (a.x + 0.5) * cell;
-      const cy = this.originY + (a.y + 0.5) * cell;
-      const dx = x - cx;
-      const dy = y - cy;
-      const d2 = dx * dx + dy * dy;
+      var cx = this.originX + (a.x + 0.5) * cell;
+      var cy = this.originY + (a.y + 0.5) * cell;
+      var dx = x - cx;
+      var dy = y - cy;
+      var d2 = dx * dx + dy * dy;
       if (d2 <= bestDist) {
         bestDist = d2;
         best = a;
@@ -264,35 +362,67 @@
   };
 
   FrontPathGame.prototype._onTap = function (x, y) {
-    // Buttons always work; NEVER gate on animations / busy / single-anim lock.
-    const btn = this._hitButton(x, y);
+    var btn = this._hitButton(x, y);
     if (btn) {
-      if (btn.id === 'retry') this.loadLevel(this.levelIndex);
+      this._beep('tap');
+      if (btn.id === 'play') {
+        this.loadLevel(0);
+        return;
+      }
+      if (btn.id === 'continue') {
+        this.loadLevel(Math.min(this.maxUnlocked - 1, LEVELS.length - 1));
+        return;
+      }
+      if (btn.id === 'menu') {
+        this.screen = 'title';
+        this.state = 'title';
+        this.board = null;
+        this.anims = [];
+        this.particles = [];
+        return;
+      }
+      if (btn.id === 'sound') {
+        this.soundOn = !this.soundOn;
+        storageSet(SOUND_KEY, this.soundOn);
+        return;
+      }
+      if (btn.id === 'retry') {
+        this.loadLevel(this.levelIndex);
+        return;
+      }
       if (btn.id === 'next') {
-        if (this.state === 'clear') {
+        if (this.state === 'clear' || this.screen === 'clear') {
           if (this.levelIndex < LEVELS.length - 1) this.loadLevel(this.levelIndex + 1);
-          else this.loadLevel(0);
+          else {
+            this.screen = 'title';
+            this.state = 'title';
+            this.board = null;
+          }
         } else if (this.levelIndex + 1 < this.maxUnlocked) {
           this.loadLevel(this.levelIndex + 1);
         }
+        return;
       }
-      if (btn.id === 'prev' && this.levelIndex > 0) this.loadLevel(this.levelIndex - 1);
+      if (btn.id === 'prev' && this.levelIndex > 0) {
+        this.loadLevel(this.levelIndex - 1);
+        return;
+      }
       return;
     }
 
+    if (this.screen === 'title') return;
     if (this.state !== 'playing') return;
+    if (!this.board) return;
 
-    const arrow = this._hitArrow(x, y);
+    var arrow = this._hitArrow(x, y);
     if (!arrow) return;
-    // Start immediately — concurrent slides are allowed.
     this._trySlide(arrow);
   };
 
   FrontPathGame.prototype._occupied = function (x, y, skip) {
-    for (let i = 0; i < this.board.arrows.length; i++) {
-      const a = this.board.arrows[i];
+    for (var i = 0; i < this.board.arrows.length; i++) {
+      var a = this.board.arrows[i];
       if (a === skip) continue;
-      // Departing / sliding-out arrows do not block — chains work mid-flight.
       if (a.departing || this._isSliding(a)) continue;
       if (a.x === x && a.y === y) return true;
     }
@@ -300,10 +430,10 @@
   };
 
   FrontPathGame.prototype._pathClear = function (arrow) {
-    const dir = D[arrow.d];
-    let x = arrow.x + dir[0];
-    let y = arrow.y + dir[1];
-    const path = [];
+    var dir = D[arrow.d];
+    var x = arrow.x + dir[0];
+    var y = arrow.y + dir[1];
+    var path = [];
     while (x >= 0 && y >= 0 && x < this.board.w && y < this.board.h) {
       if (this._occupied(x, y, arrow)) {
         return { ok: false, blockedAt: { x: x, y: y }, path: path };
@@ -315,62 +445,89 @@
     return { ok: true, path: path, exit: { x: x, y: y } };
   };
 
+  FrontPathGame.prototype._spawnClearParticles = function () {
+    var cx = this.width / 2;
+    var cy = this.height / 2;
+    for (var i = 0; i < 28; i++) {
+      var ang = (Math.PI * 2 * i) / 28 + Math.random() * 0.2;
+      var spd = 60 + Math.random() * 160;
+      this.particles.push({
+        x: cx,
+        y: cy,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        life: 0.7 + Math.random() * 0.5,
+        age: 0,
+        color: i % 2 ? COLORS.arrow : COLORS.accent,
+        r: 2 + Math.random() * 3,
+      });
+    }
+  };
+
   FrontPathGame.prototype._checkClear = function () {
     if (this.state !== 'playing') return;
-    const idle = this.board.arrows.filter(function (a) { return !a.departing; });
-    const sliding = this.anims.some(function (a) { return a.type === 'slide'; });
+    var idle = this.board.arrows.filter(function (a) {
+      return !a.departing;
+    });
+    var sliding = this.anims.some(function (a) {
+      return a.type === 'slide';
+    });
     if (idle.length === 0 && !sliding) {
       this.state = 'clear';
+      this.screen = 'clear';
       this.message = 'Clear!';
-      this.messageUntil = performanceNow() + 2000;
+      this.messageUntil = performanceNow() + 2500;
       if (!this.levelTimerFrozen) {
         this.levelElapsedMs = Math.max(0, performanceNow() - this.levelStartedAt);
         this.levelTimerFrozen = true;
         this.totalElapsedMs = this._totalAccruedBase + this.levelElapsedMs;
         this._totalAccruedBase = this.totalElapsedMs;
-        storageSet('front_path_total_ms', this.totalElapsedMs);
+        storageSet(TOTAL_KEY, this.totalElapsedMs);
+        var id = String(this.board.id);
+        var prev = this.bestTimes[id];
+        if (prev == null || this.levelElapsedMs < prev) {
+          this.bestTimes[id] = this.levelElapsedMs;
+          storageSet(BEST_KEY, this.bestTimes);
+          this._newBest = true;
+        } else {
+          this._newBest = false;
+        }
       }
-      const unlocked = Math.max(this.maxUnlocked, this.levelIndex + 2);
+      var unlocked = Math.max(this.maxUnlocked, this.levelIndex + 2);
       this.maxUnlocked = Math.min(unlocked, LEVELS.length);
-      storageSet('front_path_max_unlocked', this.maxUnlocked);
+      storageSet(UNLOCK_KEY, this.maxUnlocked);
+      this.clearBurstAt = performanceNow();
+      this._spawnClearParticles();
+      this._beep('clear');
     }
   };
 
   FrontPathGame.prototype._trySlide = function (arrow) {
     if (!arrow || arrow.departing) return;
-    const result = this._pathClear(arrow);
+    var result = this._pathClear(arrow);
     if (!result.ok) {
       this.flash = { arrow: arrow, until: performanceNow() + 220, kind: 'blocked' };
       this.message = 'Blocked';
-      this.messageUntil = performanceNow() + 600;
+      this.messageUntil = performanceNow() + 550;
       this.anims = this.anims.filter(function (a) {
         return !(a.type === 'shake' && a.arrow === arrow);
       });
-      this.anims.push({
-        type: 'shake',
-        arrow: arrow,
-        t0: performanceNow(),
-        dur: 220,
-      });
+      this.anims.push({ type: 'shake', arrow: arrow, t0: performanceNow(), dur: 220 });
+      this._beep('block');
       return;
     }
 
-    // Mark departing IMMEDIATELY so:
-    // 1) other taps never wait
-    // 2) this cell is free for hit-testing other arrows' paths
-    // 3) collision treats it as already cleared
     arrow.departing = true;
-
-    const cells = result.path.slice();
+    var cells = result.path.slice();
     cells.push(result.exit);
-    const anim = {
+    var anim = {
       type: 'slide',
       arrow: arrow,
       cells: cells,
       t0: performanceNow(),
-      dur: Math.max(140, cells.length * 55),
+      dur: Math.max(130, cells.length * 50),
     };
-    const self = this;
+    var self = this;
     anim.onDone = function () {
       self.board.arrows = self.board.arrows.filter(function (a) {
         return a !== arrow;
@@ -381,33 +538,27 @@
       self._checkClear();
     };
     this.anims.push(anim);
-    // Eager clear-check so UI can show progress; full clear waits for anims.
-    // (kept playing until slides finish)
+    this._beep('slide');
   };
-
-  function performanceNow() {
-    if (typeof performance !== 'undefined' && performance.now) return performance.now();
-    return Date.now();
-  }
 
   FrontPathGame.prototype._loop = function (ts) {
     if (!this._running) return;
-    const dt = this._last ? Math.min(50, ts - this._last) : 16;
+    var dt = this._last ? Math.min(50, ts - this._last) : 16;
     this._last = ts;
     this._update(ts, dt);
     this._draw(ts);
     this._raf(this._loop);
   };
 
-  FrontPathGame.prototype._update = function (ts) {
+  FrontPathGame.prototype._update = function (ts, dt) {
+    this.titlePulse = ts;
     if (!this.levelTimerFrozen && this.state === 'playing' && this.levelStartedAt) {
       this.levelElapsedMs = Math.max(0, ts - this.levelStartedAt);
     }
-    // Copy list — onDone mutates this.anims
-    const list = this.anims.slice();
-    for (let i = 0; i < list.length; i++) {
-      const anim = list[i];
-      const t = (ts - anim.t0) / anim.dur;
+    var list = this.anims.slice();
+    for (var i = 0; i < list.length; i++) {
+      var anim = list[i];
+      var t = (ts - anim.t0) / anim.dur;
       if (t >= 1) {
         if (anim.onDone) anim.onDone();
         else {
@@ -418,71 +569,170 @@
       }
     }
     if (this.flash && ts > this.flash.until) this.flash = null;
+
+    var dts = (dt || 16) / 1000;
+    for (var p = this.particles.length - 1; p >= 0; p--) {
+      var pt = this.particles[p];
+      pt.age += dts;
+      pt.x += pt.vx * dts;
+      pt.y += pt.vy * dts;
+      pt.vy += 40 * dts;
+      if (pt.age >= pt.life) this.particles.splice(p, 1);
+    }
+  };
+
+  FrontPathGame.prototype._drawBg = function (ctx, w, h) {
+    var g = ctx.createLinearGradient(0, 0, 0, h);
+    g.addColorStop(0, COLORS.bg0);
+    g.addColorStop(1, COLORS.bg1);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, w, h);
+    // soft vignette dots
+    ctx.fillStyle = 'rgba(90,208,255,0.03)';
+    for (var i = 0; i < 12; i++) {
+      var rx = ((i * 97) % w);
+      var ry = ((i * 53) % h);
+      ctx.beginPath();
+      ctx.arc(rx, ry, 40 + (i % 5) * 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
   };
 
   FrontPathGame.prototype._draw = function (ts) {
-    const ctx = this.ctx;
-    const w = this.width;
-    const h = this.height;
+    var ctx = this.ctx;
+    var w = this.width;
+    var h = this.height;
     ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = COLORS.bg;
-    ctx.fillRect(0, 0, w, h);
+    this._drawBg(ctx, w, h);
+    this.buttons = [];
 
-    // Header
+    if (this.screen === 'title') {
+      this._drawTitle(ctx, w, h, ts);
+      return;
+    }
+
+    this._drawPlay(ctx, w, h, ts);
+
+    // particles on top
+    for (var i = 0; i < this.particles.length; i++) {
+      var pt = this.particles[i];
+      var a = 1 - pt.age / pt.life;
+      ctx.globalAlpha = Math.max(0, a);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, pt.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  };
+
+  FrontPathGame.prototype._drawTitle = function (ctx, w, h, ts) {
+    var pulse = 0.5 + 0.5 * Math.sin((ts || 0) / 500);
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
     ctx.fillStyle = COLORS.text;
-    ctx.font = 'bold 22px system-ui, -apple-system, sans-serif';
+    ctx.font = 'bold 42px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Front Path', w / 2, h * 0.22);
+
+    ctx.fillStyle = COLORS.muted;
+    ctx.font = '15px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Slide arrows off the board · plan the order', w / 2, h * 0.22 + 36);
+
+    // decorative arrow row
+    var demoY = h * 0.38;
+    var dirs = ['L', 'U', 'R', 'D'];
+    for (var i = 0; i < 4; i++) {
+      this._drawArrowAt(ctx, w / 2 + (i - 1.5) * 56, demoY, dirs[i], COLORS.arrow, 0.75 + pulse * 0.25, 0, 44);
+    }
+
+    var cleared = 0;
+    for (var k in this.bestTimes) if (Object.prototype.hasOwnProperty.call(this.bestTimes, k)) cleared++;
+
+    ctx.fillStyle = COLORS.accent;
+    ctx.font = '13px system-ui, -apple-system, sans-serif';
+    ctx.fillText(
+      LEVELS.length + ' levels · ' + Math.max(0, this.maxUnlocked - 1) + ' cleared · best records ' + cleared,
+      w / 2,
+      h * 0.48
+    );
+
+    var bw = Math.min(220, w - 48);
+    var bh = 52;
+    var bx = (w - bw) / 2;
+    this._drawBtn(ctx, bx, h * 0.56, bw, bh, this.maxUnlocked > 1 ? 'Continue' : 'Play', this.maxUnlocked > 1 ? 'continue' : 'play', false, true);
+    if (this.maxUnlocked > 1) {
+      this._drawBtn(ctx, bx, h * 0.56 + 64, bw, bh, 'Play from Level 1', 'play', false, false);
+    }
+    this._drawBtn(ctx, bx, h * 0.56 + (this.maxUnlocked > 1 ? 128 : 64), bw, 44, this.soundOn ? 'Sound: On' : 'Sound: Off', 'sound', false, false);
+
+    ctx.fillStyle = COLORS.muted;
+    ctx.font = '12px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Tap arrows anytime — no waiting for slides', w / 2, h - 36);
+  };
+
+  FrontPathGame.prototype._drawPlay = function (ctx, w, h, ts) {
+    var lv = this.board;
+    var best = this.bestTimes[String(lv.id)];
+
+    // HUD top
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    ctx.fillText('Front Path', 20, 18);
+    ctx.fillStyle = COLORS.text;
+    ctx.font = 'bold 20px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Front Path', 18, 14);
 
     ctx.fillStyle = COLORS.muted;
-    ctx.font = '14px system-ui, -apple-system, sans-serif';
-    const lv = this.board;
-    ctx.fillText('Level ' + lv.id + ' · ' + lv.name + ' / ' + LEVELS.length, 20, 48);
+    ctx.font = '13px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Lv ' + lv.id + ' / ' + LEVELS.length + '  ·  ' + lv.name, 18, 40);
 
-    ctx.textAlign = 'right';
-    ctx.fillStyle = COLORS.accent;
     var leftCount = 0;
     for (var li = 0; li < lv.arrows.length; li++) if (!lv.arrows[li].departing) leftCount++;
-    ctx.fillText(leftCount + ' left', w - 20, 48);
 
-    // Level timer (mm:ss) — freezes on Clear
     ctx.textAlign = 'right';
     ctx.fillStyle = this.levelTimerFrozen ? COLORS.arrowOk : COLORS.text;
-    ctx.font = 'bold 18px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillText(formatTime(this.levelElapsedMs), w - 20, 18);
+    ctx.font = 'bold 22px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(formatTime(this.levelElapsedMs), w - 18, 12);
     ctx.fillStyle = COLORS.muted;
     ctx.font = '11px system-ui, -apple-system, sans-serif';
-    ctx.fillText(this.levelTimerFrozen ? 'cleared' : 'level time', w - 20, 38);
+    ctx.fillText(this.levelTimerFrozen ? 'cleared' : 'level time', w - 18, 36);
 
-    // Board background
-    const boardW = this.cell * lv.w;
-    const boardH = this.cell * lv.h;
-    roundRect(ctx, this.originX - 8, this.originY - 8, boardW + 16, boardH + 16, 12);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = COLORS.accent;
+    ctx.font = '12px system-ui, -apple-system, sans-serif';
+    var bestLabel = best != null ? 'Best ' + formatTime(best) : 'Best —';
+    ctx.fillText(bestLabel + '   ·   ' + leftCount + ' left', 18, 58);
+
+    // Board panel
+    var boardW = this.cell * lv.w;
+    var boardH = this.cell * lv.h;
+    roundRect(ctx, this.originX - 10, this.originY - 10, boardW + 20, boardH + 20, 16);
     ctx.fillStyle = COLORS.panel;
     ctx.fill();
+    ctx.strokeStyle = COLORS.panelEdge;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
 
-    for (let y = 0; y < lv.h; y++) {
-      for (let x = 0; x < lv.w; x++) {
-        const cx = this.originX + x * this.cell;
-        const cy = this.originY + y * this.cell;
-        const pad = 3;
-        roundRect(ctx, cx + pad, cy + pad, this.cell - pad * 2, this.cell - pad * 2, 8);
-        ctx.fillStyle = COLORS.cell;
+    for (var y = 0; y < lv.h; y++) {
+      for (var x = 0; x < lv.w; x++) {
+        var cx = this.originX + x * this.cell;
+        var cy = this.originY + y * this.cell;
+        var pad = Math.max(2, Math.floor(this.cell * 0.08));
+        roundRect(ctx, cx + pad, cy + pad, this.cell - pad * 2, this.cell - pad * 2, Math.min(10, this.cell * 0.22));
+        ctx.fillStyle = (x + y) % 2 === 0 ? COLORS.cell : COLORS.cellHi;
         ctx.fill();
       }
     }
 
     // Arrows
-    for (let i = 0; i < lv.arrows.length; i++) {
-      const a = lv.arrows[i];
-      let drawX = a.x;
-      let drawY = a.y;
-      let alpha = 1;
-      let shake = 0;
-
-      let anim = null;
-      for (let ai = 0; ai < this.anims.length; ai++) {
+    for (var i = 0; i < lv.arrows.length; i++) {
+      var a = lv.arrows[i];
+      var drawX = a.x;
+      var drawY = a.y;
+      var alpha = 1;
+      var shake = 0;
+      var anim = null;
+      for (var ai = 0; ai < this.anims.length; ai++) {
         if (this.anims[ai].arrow === a) {
           anim = this.anims[ai];
           break;
@@ -490,122 +740,151 @@
       }
       if (anim) {
         if (anim.type === 'slide') {
-          const t = Math.min(1, (ts - anim.t0) / anim.dur);
-          const eased = easeIn(t);
-          const positions = [{ x: a.x, y: a.y }].concat(anim.cells);
-          const pIdx = eased * (positions.length - 1);
-          const p0 = Math.floor(pIdx);
-          const p1 = Math.min(p0 + 1, positions.length - 1);
-          const pf = pIdx - p0;
+          var t = Math.min(1, (ts - anim.t0) / anim.dur);
+          var eased = easeIn(t);
+          var positions = [{ x: a.x, y: a.y }].concat(anim.cells);
+          var pIdx = eased * (positions.length - 1);
+          var p0 = Math.floor(pIdx);
+          var p1 = Math.min(p0 + 1, positions.length - 1);
+          var pf = pIdx - p0;
           drawX = positions[p0].x + (positions[p1].x - positions[p0].x) * pf;
           drawY = positions[p0].y + (positions[p1].y - positions[p0].y) * pf;
-          alpha = 1 - eased * 0.85;
+          alpha = 1 - eased * 0.9;
         } else if (anim.type === 'shake') {
-          const t = Math.min(1, (ts - anim.t0) / anim.dur);
-          shake = Math.sin(t * Math.PI * 6) * (1 - t) * 4;
+          var t2 = Math.min(1, (ts - anim.t0) / anim.dur);
+          shake = Math.sin(t2 * Math.PI * 7) * (1 - t2) * 5;
         }
       }
-
-      let color = COLORS.arrow;
+      var color = COLORS.arrow;
       if (this.flash && this.flash.arrow === a) color = COLORS.arrowBlocked;
       this._drawArrow(ctx, drawX, drawY, a.d, color, alpha, shake);
-    }
-
-    // Clear overlay
-    if (this.state === 'clear') {
-      ctx.fillStyle = 'rgba(15,20,25,0.55)';
-      ctx.fillRect(0, 0, w, h);
-      ctx.fillStyle = COLORS.arrowOk;
-      ctx.font = 'bold 36px system-ui, -apple-system, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText('Clear!', w / 2, h / 2 - 40);
-      ctx.fillStyle = COLORS.text;
-      ctx.font = 'bold 20px ui-monospace, SFMono-Regular, Menlo, monospace';
-      ctx.fillText(formatTime(this.levelElapsedMs), w / 2, h / 2 + 4);
-      ctx.fillStyle = COLORS.muted;
-      ctx.font = '13px system-ui, -apple-system, sans-serif';
-      ctx.fillText('level time', w / 2, h / 2 + 28);
     }
 
     // Transient message
     if (this.message && ts < this.messageUntil && this.state === 'playing') {
       ctx.fillStyle = COLORS.arrowBlocked;
-      ctx.font = 'bold 16px system-ui, -apple-system, sans-serif';
+      ctx.font = 'bold 15px system-ui, -apple-system, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(this.message, w / 2, this.originY - 18);
+      ctx.fillText(this.message, w / 2, this.originY - 16);
     }
 
-    // Buttons
-    this.buttons = [];
-    const btnY = this.footerY;
-    const btnH = 44;
-    const gap = 12;
-    const btnW = Math.min(110, (w - 40 - gap * 2) / 3);
+    // Clear overlay
+    if (this.state === 'clear') {
+      var burst = this.clearBurstAt ? Math.min(1, (ts - this.clearBurstAt) / 400) : 1;
+      ctx.fillStyle = 'rgba(11,16,23,' + (0.45 + 0.2 * burst) + ')';
+      ctx.fillRect(0, 0, w, h);
 
-    this._drawBtn(ctx, 20, btnY, btnW, btnH, 'Retry', 'retry');
-    const midX = (w - btnW) / 2;
-    if (this.levelIndex > 0) {
-      this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Prev', 'prev');
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = COLORS.arrowOk;
+      ctx.font = 'bold 40px system-ui, -apple-system, sans-serif';
+      ctx.fillText('Clear!', w / 2, h / 2 - 54);
+
+      ctx.fillStyle = COLORS.text;
+      ctx.font = 'bold 26px ui-monospace, SFMono-Regular, Menlo, monospace';
+      ctx.fillText(formatTime(this.levelElapsedMs), w / 2, h / 2 - 10);
+
+      ctx.fillStyle = this._newBest ? COLORS.accent : COLORS.muted;
+      ctx.font = '14px system-ui, -apple-system, sans-serif';
+      var bestLine = best != null ? 'Best ' + formatTime(this.bestTimes[String(lv.id)]) : '';
+      ctx.fillText(this._newBest ? 'New best time!' : bestLine, w / 2, h / 2 + 18);
     }
-    const nextLabel = this.state === 'clear' ? (this.levelIndex < LEVELS.length - 1 ? 'Next' : 'Again') : 'Next';
-    const nextEnabled = this.state === 'clear' || this.levelIndex + 1 < this.maxUnlocked;
-    this._drawBtn(ctx, w - 20 - btnW, btnY, btnW, btnH, nextLabel, 'next', !nextEnabled && this.state !== 'clear');
+
+    // Footer buttons
+    var btnY = this.footerY;
+    var btnH = 46;
+    var gap = 10;
+    var btnW = Math.min(108, (w - 36 - gap * 2) / 3);
+    this._drawBtn(ctx, 16, btnY, btnW, btnH, 'Retry', 'retry');
+    var midX = (w - btnW) / 2;
+    if (this.levelIndex > 0) this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Prev', 'prev');
+    else this._drawBtn(ctx, midX, btnY, btnW, btnH, 'Menu', 'menu');
+
+    var nextLabel =
+      this.state === 'clear'
+        ? this.levelIndex < LEVELS.length - 1
+          ? 'Next'
+          : 'Menu'
+        : 'Next';
+    var nextEnabled = this.state === 'clear' || this.levelIndex + 1 < this.maxUnlocked;
+    this._drawBtn(ctx, w - 16 - btnW, btnY, btnW, btnH, nextLabel, 'next', !nextEnabled && this.state !== 'clear', this.state === 'clear');
   };
 
-  FrontPathGame.prototype._drawBtn = function (ctx, x, y, bw, bh, label, id, disabled) {
-    this.buttons.push({ x: x, y: y, w: bw, h: bh, id: id });
-    roundRect(ctx, x, y, bw, bh, 10);
-    ctx.fillStyle = disabled ? '#1a2330' : COLORS.btn;
+  FrontPathGame.prototype._drawBtn = function (ctx, x, y, bw, bh, label, id, disabled, primary) {
+    this.buttons.push({ x: x, y: y, w: bw, h: bh, id: id, disabled: !!disabled });
+    roundRect(ctx, x, y, bw, bh, 12);
+    if (primary && !disabled) {
+      var g = ctx.createLinearGradient(x, y, x, y + bh);
+      g.addColorStop(0, '#3a8be0');
+      g.addColorStop(1, COLORS.btnPrimary);
+      ctx.fillStyle = g;
+    } else {
+      ctx.fillStyle = disabled ? '#152032' : COLORS.btn;
+    }
     ctx.fill();
-    ctx.strokeStyle = disabled ? '#2a3545' : '#3d5270';
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = disabled ? '#243044' : primary ? COLORS.btnPrimaryEdge : COLORS.btnEdge;
+    ctx.lineWidth = 1.2;
     ctx.stroke();
-    ctx.fillStyle = disabled ? '#556678' : COLORS.text;
+    ctx.fillStyle = disabled ? '#5a6b80' : COLORS.text;
     ctx.font = 'bold 15px system-ui, -apple-system, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(label, x + bw / 2, y + bh / 2);
+    ctx.fillText(label, x + bw / 2, y + bh / 2 + 0.5);
   };
 
   FrontPathGame.prototype._drawArrow = function (ctx, gx, gy, dir, color, alpha, shake) {
-    const cx = this.originX + (gx + 0.5) * this.cell + (shake || 0);
-    const cy = this.originY + (gy + 0.5) * this.cell;
-    const s = this.cell * 0.32;
+    var cx = this.originX + (gx + 0.5) * this.cell + (shake || 0);
+    var cy = this.originY + (gy + 0.5) * this.cell;
+    this._drawArrowAt(ctx, cx, cy, dir, color, alpha, shake, this.cell);
+  };
+
+  FrontPathGame.prototype._drawArrowAt = function (ctx, cx, cy, dir, color, alpha, shake, cell) {
+    var s = cell * 0.3;
     ctx.save();
     ctx.globalAlpha = alpha == null ? 1 : alpha;
     ctx.translate(cx, cy);
-    const rot = { U: -Math.PI / 2, D: Math.PI / 2, L: Math.PI, R: 0 }[dir];
+    var rot = { U: -Math.PI / 2, D: Math.PI / 2, L: Math.PI, R: 0 }[dir];
     ctx.rotate(rot);
 
-    // soft shadow circle
+    // glow
     ctx.beginPath();
-    ctx.arc(0, 0, this.cell * 0.36, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.arc(0, 0, cell * 0.4, 0, Math.PI * 2);
+    ctx.fillStyle = COLORS.glow;
+    ctx.fill();
+
+    // body
+    ctx.beginPath();
+    ctx.arc(0, 0, cell * 0.34, 0, Math.PI * 2);
+    var g = ctx.createRadialGradient(-cell * 0.1, -cell * 0.1, 2, 0, 0, cell * 0.34);
+    g.addColorStop(0, '#9ae6ff');
+    g.addColorStop(0.55, color);
+    g.addColorStop(1, COLORS.arrowDeep);
+    ctx.fillStyle = g;
     ctx.fill();
 
     ctx.beginPath();
-    ctx.arc(0, 0, this.cell * 0.34, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
+    ctx.arc(0, 0, cell * 0.34, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
 
-    // chevron pointing right (after rotate)
-    ctx.fillStyle = '#0a121c';
+    // chevron
+    ctx.fillStyle = '#071018';
     ctx.beginPath();
-    ctx.moveTo(s * 0.85, 0);
-    ctx.lineTo(-s * 0.35, s * 0.75);
-    ctx.lineTo(-s * 0.35, s * 0.28);
+    ctx.moveTo(s * 0.9, 0);
+    ctx.lineTo(-s * 0.3, s * 0.72);
+    ctx.lineTo(-s * 0.3, s * 0.28);
     ctx.lineTo(-s * 0.85, s * 0.28);
     ctx.lineTo(-s * 0.85, -s * 0.28);
-    ctx.lineTo(-s * 0.35, -s * 0.28);
-    ctx.lineTo(-s * 0.35, -s * 0.75);
+    ctx.lineTo(-s * 0.3, -s * 0.28);
+    ctx.lineTo(-s * 0.3, -s * 0.72);
     ctx.closePath();
     ctx.fill();
     ctx.restore();
   };
 
   function roundRect(ctx, x, y, w, h, r) {
-    const rr = Math.min(r, w / 2, h / 2);
+    var rr = Math.min(r, w / 2, h / 2);
     ctx.beginPath();
     ctx.moveTo(x + rr, y);
     ctx.arcTo(x + w, y, x + w, y + h, rr);
@@ -615,22 +894,18 @@
     ctx.closePath();
   }
 
-  function easeIn(t) {
-    return t * t;
-  }
-
-  function formatTime(ms) {
-    ms = Math.max(0, Math.floor(ms || 0));
-    const totalSec = Math.floor(ms / 1000);
-    const m = Math.floor(totalSec / 60);
-    const sec = totalSec % 60;
-    return (m < 10 ? '0' : '') + m + ':' + (sec < 10 ? '0' : '') + sec;
-  }
-
   FrontPathGame.prototype.destroy = function () {
     this._running = false;
   };
 
   root.FrontPathGame = FrontPathGame;
   root.FrontPathLEVELS = LEVELS;
-})(typeof GameGlobal !== 'undefined' ? GameGlobal : typeof window !== 'undefined' ? window : typeof globalThis !== 'undefined' ? globalThis : this);
+})(
+  typeof GameGlobal !== 'undefined'
+    ? GameGlobal
+    : typeof window !== 'undefined'
+      ? window
+      : typeof globalThis !== 'undefined'
+        ? globalThis
+        : this
+);

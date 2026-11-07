@@ -2,17 +2,21 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#0b1017" />
   <title>Front Path</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html, body {
       width: 100%;
       height: 100%;
-      background: #0f1419;
+      background: #0b1017;
       overflow: hidden;
       touch-action: none;
       font-family: system-ui, -apple-system, sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
     }
     #wrap {
       width: 100%;
@@ -28,21 +32,12 @@
       max-width: 720px;
       touch-action: none;
     }
-    .hint {
-      position: fixed;
-      left: 0; right: 0; bottom: 8px;
-      text-align: center;
-      color: #556678;
-      font-size: 11px;
-      pointer-events: none;
-    }
   </style>
 </head>
 <body>
   <div id="wrap"><canvas id="game"></canvas></div>
-  <div class="hint">Browser preview · tap an arrow to slide · same logic as WeChat mini-game</div>
-  <script src="js/levels.js?v=4"></script>
-  <script src="js/game-core.js?v=4"></script>
+  <script src="js/levels.js?v=5"></script>
+  <script src="js/game-core.js?v=5"></script>
   <script>
     (function () {
       var canvas = document.getElementById('game');

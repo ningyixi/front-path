@@ -1,22 +1,21 @@
 # Front Path
 
-Arrow-slide path puzzle for **WeChat mini-game** + browser preview.
+Arrow-slide path puzzle — **WeChat mini-game** + browser.
 
-## Play
+**Play:** https://ningyixi.github.io/front-path/
 
-- Browser: https://ningyixi.github.io/front-path/
-- WeChat DevTools: open this folder as a **游戏** project (`touristappid` in `project.config.json`)
+## Features
 
-## How to play
+- 100 DFS-verified levels (boards grow harder)
+- Concurrent slides — tap the next arrow while others move
+- Level timer + best times saved locally
+- Title screen, clear celebration, soft sound toggle
+- English UI
 
-Tap an arrow to slide it off the board in its direction. Blocked paths shake. Clear every arrow to finish the level.
+## Controls
 
-- **Multi-slide:** tap the next arrow while others are still moving
-- **Timer:** level time (mm:ss) in the top-right; freezes on Clear
-- **100 levels** with boards that grow and get harder
+Tap an arrow to slide it off the board in its facing direction. Clear the board to win.
 
-## Dev
+## WeChat
 
-```bash
-npx serve .
-```
+Open this folder in WeChat DevTools as a **游戏** project (`touristappid`).
