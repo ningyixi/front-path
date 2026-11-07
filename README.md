@@ -46,7 +46,11 @@ Progress is stored in `localStorage` in the browser, and in `wx` storage inside 
 
 ## Levels
 
-Five handcrafted stages with rising arrow counts (`js/levels.js`). Clear a level to unlock the next; progress key: `front_path_max_unlocked`.
+**34** stages in `js/levels.js` (all verified solvable). Difficulty ramps with board size: early ~6×6 with few arrows; mid crossed paths on ~8×8–11×11; late large grids up to **16×12 / 14×16** with denser interlocking. Clear a level to unlock the next; progress key: `front_path_max_unlocked`.
+
+Play in the browser via GitHub Pages: https://ningyixi.github.io/front-path/
+
+**Controls tip:** you can tap several arrows in a row — they slide off at the same time.
 
 ## Layout
 

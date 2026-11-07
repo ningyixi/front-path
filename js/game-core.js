@@ -75,12 +75,12 @@
 
     this.maxUnlocked = Number(storageGet('front_path_max_unlocked', 1)) || 1;
     this.levelIndex = Math.min(this.maxUnlocked, LEVELS.length) - 1;
-    this.state = null; // playing | clear | anim
+    this.state = null; // playing | clear
     this.board = null;
     this.cell = 0;
     this.originX = 0;
     this.originY = 0;
-    this.anim = null;
+    this.anims = []; // concurrent slide/shake animations
     this.flash = null;
     this.buttons = [];
     this.message = '';
@@ -117,19 +117,24 @@
 
   FrontPathGame.prototype._layout = function () {
     if (!this.board) return;
-    const pad = 20;
-    const header = 88;
-    const footer = 96;
-    const availW = this.width - pad * 2;
-    const availH = this.height - header - footer - pad;
-    this.cell = Math.floor(Math.min(availW / this.board.w, availH / this.board.h));
-    this.cell = Math.max(36, Math.min(this.cell, 72));
+    // Use most of the viewport: thin chrome, large cells, roomy boards.
+    const padX = Math.max(8, Math.floor(this.width * 0.02));
+    const padY = 8;
+    const header = Math.max(64, Math.min(84, Math.floor(this.height * 0.1)));
+    const footer = Math.max(72, Math.min(96, Math.floor(this.height * 0.12)));
+    const availW = this.width - padX * 2;
+    const availH = this.height - header - footer - padY;
+    let cell = Math.floor(Math.min(availW / this.board.w, availH / this.board.h));
+    // Prefer filling the screen; allow big cells on phones/tablets and huge boards.
+    const minCell = this.board.w >= 10 || this.board.h >= 10 ? 22 : 28;
+    const maxCell = 96;
+    this.cell = Math.max(minCell, Math.min(cell, maxCell));
     const boardW = this.cell * this.board.w;
     const boardH = this.cell * this.board.h;
     this.originX = Math.floor((this.width - boardW) / 2);
-    this.originY = Math.floor(header + (availH - boardH) / 2);
-    this.headerY = 24;
-    this.footerY = this.height - 72;
+    this.originY = Math.floor(header + Math.max(0, (availH - boardH) / 2));
+    this.headerY = Math.max(16, Math.floor(header * 0.28));
+    this.footerY = this.height - Math.max(56, footer - 16);
   };
 
   FrontPathGame.prototype.loadLevel = function (index) {
@@ -137,7 +142,7 @@
     this.levelIndex = index;
     this.board = cloneLevel(LEVELS[index]);
     this.state = 'playing';
-    this.anim = null;
+    this.anims = [];
     this.flash = null;
     this.message = '';
     this._layout();
@@ -183,8 +188,15 @@
     return null;
   };
 
+  FrontPathGame.prototype._isSliding = function (arrow) {
+    for (let i = 0; i < this.anims.length; i++) {
+      if (this.anims[i].type === 'slide' && this.anims[i].arrow === arrow) return true;
+    }
+    return false;
+  };
+
   FrontPathGame.prototype._onTap = function (x, y) {
-    if (this.anim) return;
+    // Buttons always work; arrow taps allowed while other arrows are mid-slide.
     const btn = this._hitButton(x, y);
     if (btn) {
       if (btn.id === 'retry') this.loadLevel(this.levelIndex);
@@ -210,6 +222,7 @@
       return a.x === gx && a.y === gy;
     });
     if (!arrow) return;
+    if (this._isSliding(arrow)) return; // already departing
     this._trySlide(arrow);
   };
 
@@ -217,6 +230,8 @@
     for (let i = 0; i < this.board.arrows.length; i++) {
       const a = this.board.arrows[i];
       if (a === skip) continue;
+      // Sliding-out arrows are treated as already cleared for blocking.
+      if (this._isSliding(a)) continue;
       if (a.x === x && a.y === y) return true;
     }
     return false;
@@ -239,48 +254,60 @@
     return { ok: true, path: path, exit: { x: x, y: y } };
   };
 
+  FrontPathGame.prototype._checkClear = function () {
+    if (this.state !== 'playing') return;
+    // Wait until every arrow is gone and no slide still drawing.
+    const sliding = this.anims.some(function (a) { return a.type === 'slide'; });
+    if (this.board.arrows.length === 0 && !sliding) {
+      this.state = 'clear';
+      this.message = 'Clear!';
+      this.messageUntil = performanceNow() + 2000;
+      const unlocked = Math.max(this.maxUnlocked, this.levelIndex + 2);
+      this.maxUnlocked = Math.min(unlocked, LEVELS.length);
+      storageSet('front_path_max_unlocked', this.maxUnlocked);
+    }
+  };
+
   FrontPathGame.prototype._trySlide = function (arrow) {
     const result = this._pathClear(arrow);
     if (!result.ok) {
       this.flash = { arrow: arrow, until: performanceNow() + 220, kind: 'blocked' };
       this.message = 'Blocked';
       this.messageUntil = performanceNow() + 600;
-      // snap-back shake anim
-      this.anim = {
+      // Drop any prior shake on this arrow, then add a new one (non-blocking).
+      this.anims = this.anims.filter(function (a) {
+        return !(a.type === 'shake' && a.arrow === arrow);
+      });
+      this.anims.push({
         type: 'shake',
         arrow: arrow,
         t0: performanceNow(),
         dur: 220,
-      };
+      });
       return;
     }
 
-    // Animate sliding out
+    // Animate sliding out — other arrows remain tappable.
     const cells = result.path.slice();
     cells.push(result.exit);
-    this.anim = {
+    const anim = {
       type: 'slide',
       arrow: arrow,
       cells: cells,
       t0: performanceNow(),
       dur: Math.max(180, cells.length * 70),
-      onDone: null,
     };
     const self = this;
-    this.anim.onDone = function () {
+    anim.onDone = function () {
       self.board.arrows = self.board.arrows.filter(function (a) {
         return a !== arrow;
       });
-      self.anim = null;
-      if (self.board.arrows.length === 0) {
-        self.state = 'clear';
-        self.message = 'Clear!';
-        self.messageUntil = performanceNow() + 2000;
-        const unlocked = Math.max(self.maxUnlocked, self.levelIndex + 2);
-        self.maxUnlocked = Math.min(unlocked, LEVELS.length);
-        storageSet('front_path_max_unlocked', self.maxUnlocked);
-      }
+      self.anims = self.anims.filter(function (a) {
+        return a !== anim;
+      });
+      self._checkClear();
     };
+    this.anims.push(anim);
   };
 
   function performanceNow() {
@@ -298,11 +325,18 @@
   };
 
   FrontPathGame.prototype._update = function (ts) {
-    if (this.anim) {
-      const t = (ts - this.anim.t0) / this.anim.dur;
+    // Copy list — onDone mutates this.anims
+    const list = this.anims.slice();
+    for (let i = 0; i < list.length; i++) {
+      const anim = list[i];
+      const t = (ts - anim.t0) / anim.dur;
       if (t >= 1) {
-        if (this.anim.onDone) this.anim.onDone();
-        else this.anim = null;
+        if (anim.onDone) anim.onDone();
+        else {
+          this.anims = this.anims.filter(function (a) {
+            return a !== anim;
+          });
+        }
       }
     }
     if (this.flash && ts > this.flash.until) this.flash = null;
@@ -358,19 +392,18 @@
       let alpha = 1;
       let shake = 0;
 
-      if (this.anim && this.anim.arrow === a) {
-        if (this.anim.type === 'slide') {
-          const t = Math.min(1, (ts - this.anim.t0) / this.anim.dur);
+      let anim = null;
+      for (let ai = 0; ai < this.anims.length; ai++) {
+        if (this.anims[ai].arrow === a) {
+          anim = this.anims[ai];
+          break;
+        }
+      }
+      if (anim) {
+        if (anim.type === 'slide') {
+          const t = Math.min(1, (ts - anim.t0) / anim.dur);
           const eased = easeIn(t);
-          const idx = eased * this.anim.cells.length;
-          const i0 = Math.min(Math.floor(idx), this.anim.cells.length - 1);
-          const i1 = Math.min(i0 + 1, this.anim.cells.length - 1);
-          const frac = idx - i0;
-          const c0 = i0 === 0 && eased < 1 / this.anim.cells.length
-            ? { x: a.x, y: a.y }
-            : this.anim.cells[Math.max(0, i0 - 1)] || { x: a.x, y: a.y };
-          // Better: interpolate from start through cells
-          const positions = [{ x: a.x, y: a.y }].concat(this.anim.cells);
+          const positions = [{ x: a.x, y: a.y }].concat(anim.cells);
           const pIdx = eased * (positions.length - 1);
           const p0 = Math.floor(pIdx);
           const p1 = Math.min(p0 + 1, positions.length - 1);
@@ -378,8 +411,8 @@
           drawX = positions[p0].x + (positions[p1].x - positions[p0].x) * pf;
           drawY = positions[p0].y + (positions[p1].y - positions[p0].y) * pf;
           alpha = 1 - eased * 0.85;
-        } else if (this.anim.type === 'shake') {
-          const t = Math.min(1, (ts - this.anim.t0) / this.anim.dur);
+        } else if (anim.type === 'shake') {
+          const t = Math.min(1, (ts - anim.t0) / anim.dur);
           shake = Math.sin(t * Math.PI * 6) * (1 - t) * 4;
         }
       }
